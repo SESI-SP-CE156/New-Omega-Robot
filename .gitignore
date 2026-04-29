@@ -1,0 +1,43 @@
+# Arquivos compilados em bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+# Extensões C
+*.so
+# Arquivos de distribuição
+Python
+build/
+dist/
+*.egg-info/
+eggs/
+# Logs e relatórios de cobertura
+*.log
+coverage
+coverage.*
+cache
+nosetests.xml
+coverage.xml
+# Ambientes virtuais
+env/
+venv/
+ENV/
+env/
+venv/
+# Configurações locais e bancos de dados SQLite
+local_settings.py
+db.sqlite3
+# Checkpoints do Jupyter Notebook
+ipynb_checkpoints/
+# Diretórios de ferramentas específicas
+pytest_cache/
+mypy_cache/
+dmypy.json
+pyre/
+pytype/
+# Configurações do PyCharm e VSCode (opcional)
+idea/
+vscode/
+# Outros arquivos temporários ou específicos de ferramentas
+*.spec
+*.pot
+*.mo
