@@ -40,4 +40,4 @@ vscode/
 # Outros arquivos temporários ou específicos de ferramentas
 *.spec
 *.pot
-*.mo
+*.mow
