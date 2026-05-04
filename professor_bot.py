@@ -6,7 +6,7 @@ import csv
 import os
 
 # --- CONFIGURAÇÕES ---
-SERIAL_PORT = "/dev/ttyAMA1"  # Porta padrão do ESP32 no Linux
+SERIAL_PORT = "/dev/ttyACM0"  # Porta padrão do ESP32 no Linux
 BAUD_RATE = 115200
 MAX_PWM = 150
 BASE_SPEED = 120  # Velocidade de cruzeiro
