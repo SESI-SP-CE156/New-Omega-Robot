@@ -91,13 +91,13 @@ def main():
                 pwm_r = np.clip(BASE_SPEED - correction, 0, MAX_PWM)
 
                 # Enviar para ESP32
-                controller.send_pwm(pwm_l, pwm_r)
+                controller.send_pwm(pwm_r, pwm_l)
                 
                 # Definir Label para IA (ex: 0=Frente, 1=Esquerda, 2=Direita)
                 label = "F" if abs(error) < 20 else ("R" if error > 0 else "L")
                 
                 # Coleta
-                controller.save_data(frame, pwm_l, pwm_r, label)
+                controller.save_data(frame, pwm_r, pwm_l, label)
             else:
                 controller.send_pwm(0, 0) # Para se perder a linha
 
