@@ -172,19 +172,23 @@ def main():
             # ==========================================
             # DEBUG E VISUALIZAÇÃO
             # ==========================================
-            # Desenha limites da área útil (Deadzone)
-            cv2.line(frame, (int(center - DEADZONE_PX), 0), (int(center - DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 2)
-            cv2.line(frame, (int(center + DEADZONE_PX), 0), (int(center + DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 2)
-            
-            # Desenha o centróide visual atual
-            if cx: 
-                color = (0, 255, 0) if current_visual_error == 0 else (0, 0, 255)
-                cv2.circle(frame, (cx, int(CAM_HEIGHT * 0.9)), 10, color, -1)
-            
-            cv2.imshow("Sistema de Visao - OBR", frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'): 
-                break
+            # Dica de ouro: Na arena, defina HEADLESS_MODE = True
+            HEADLESS_MODE = False 
+
+            if not HEADLESS_MODE:
+                # Desenha limites da área útil (Deadzone)
+                cv2.line(frame, (int(center - DEADZONE_PX), 0), (int(center - DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 2)
+                cv2.line(frame, (int(center + DEADZONE_PX), 0), (int(center + DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 2)
+                
+                # Desenha o centróide visual atual
+                if cx: 
+                    color = (0, 255, 0) if current_visual_error == 0 else (0, 0, 255)
+                    cv2.circle(frame, (cx, int(CAM_HEIGHT * 0.9)), 10, color, -1)
+                
+                cv2.imshow("Sistema de Visao - OBR", frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'): 
+                    break
     finally:
         controller.close()
         cap.release()
