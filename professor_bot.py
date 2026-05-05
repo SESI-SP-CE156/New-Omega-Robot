@@ -90,12 +90,15 @@ def setup_camera() -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
     
-    # Correção de Flicker para 60Hz (Padrão de energia elétrica no Brasil)
-    # Valores comuns V4L2: 1 = 50Hz, 2 = 60Hz
-    cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
+    # Tratamento defensivo: Aplica correção de 60Hz apenas se a constante existir na versão atual do OpenCV
+    if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'):
+        cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
+    else:
+        print("[Aviso] Constante de Power Line Frequency não encontrada no OpenCV. Ignorando...")
     
-    # Desabilitar foco automático se a câmera suportar (bom para robótica)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    # Tratamento defensivo para o foco automático
+    if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'):
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
     
     return cap
 
