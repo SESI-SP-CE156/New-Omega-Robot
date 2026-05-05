@@ -18,8 +18,8 @@ KP = 0.8  # Ganho Proporcional
 # ==========================================
 # CONFIGURAÇÕES DA CÂMERA E GEOMETRIA
 # ==========================================
-CAM_WIDTH = 1280
-CAM_HEIGHT = 720
+CAM_WIDTH = 640   # Resolução reduzida para otimização de CPU (4:3)
+CAM_HEIGHT = 480  # Resolução reduzida para otimização de CPU (4:3)
 CAM_FPS = 30
 CAM_FOV_DEGREES = 90
 
