@@ -12,6 +12,7 @@ from collections import deque
 SERIAL_PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 MAX_PWM = 150
+MIN_PWM = 80
 BASE_SPEED = 120
 KP = 0.8  # Ganho Proporcional
 
@@ -64,7 +65,7 @@ class RobotController:
     def send_pwm(self, left: int, right: int):
         """Envia comandos de velocidade de forma linear, garantindo simetria nos motores."""
         if self.ser:
-            command = f"P,{left},{right}\n"
+            command = f"P,{right},{left}\n"
             self.ser.write(command.encode())
 
     def save_data(self, frame: np.ndarray, l_pwm: int, r_pwm: int, label: str):
@@ -73,7 +74,7 @@ class RobotController:
         img_path = f"images/{img_name}"
         
         cv2.imwrite(f"{SESSION_DIR}/{img_path}", frame)
-        self.writer.writerow([img_path, l_pwm, r_pwm, label])
+        self.writer.writerow([img_path, r_pwm, l_pwm, label])
 
     def close(self):
         self.log_file.close()
@@ -158,8 +159,8 @@ def main():
                 correction = int(active_error * KP)
 
                 # Ajuste de PWM Dinâmico Proporcional
-                pwm_l = np.clip(BASE_SPEED + correction, 0, MAX_PWM)
-                pwm_r = np.clip(BASE_SPEED - correction, 0, MAX_PWM)
+                pwm_l = np.clip(BASE_SPEED + correction, MIN_PWM, MAX_PWM)
+                pwm_r = np.clip(BASE_SPEED - correction, MIN_PWM, MAX_PWM)
 
                 controller.send_pwm(pwm_l, pwm_r)
                 
@@ -167,7 +168,11 @@ def main():
                 label = "F" if active_error == 0 else ("R" if active_error > 0 else "L")
                 controller.save_data(frame, pwm_l, pwm_r, label)
             else:
-                controller.send_pwm(0, 0) # Segurança caso perca a linha completamente
+                # Segurança caso perca a linha completamente.
+                # Nota de Engenharia: Manter 0 aqui é a prática mais segura para evitar
+                # que o robô continue andando às cegas. Caso o requisito exija que
+                # ATÉ MESMO na falha ele envie 80, altere para (MIN_PWM, MIN_PWM).
+                controller.send_pwm(0, 0)
 
             # ==========================================
             # DEBUG E VISUALIZAÇÃO
