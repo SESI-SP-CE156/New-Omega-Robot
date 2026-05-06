@@ -152,15 +152,14 @@ def main():
             error_queue.append(current_visual_error)
 
             # 3. Execução do Controle (Lendo o erro que a câmera viu `DELAY_FRAMES` atrás)
-            # Dessa forma, o robô só age quando a roda estiver de fato passando pela área lida.
             active_error = error_queue[0]
 
             if cx is not None:
                 correction = int(active_error * KP)
 
-                # Ajuste de PWM Dinâmico Proporcional
-                pwm_l = np.clip(BASE_SPEED + correction, MIN_PWM, MAX_PWM)
-                pwm_r = np.clip(BASE_SPEED - correction, MIN_PWM, MAX_PWM)
+                # Ajuste de PWM Dinâmico Proporcional garantindo MIN_PWM (80) e MAX_PWM (150)
+                pwm_l = int(np.clip(BASE_SPEED + correction, MIN_PWM, MAX_PWM))
+                pwm_r = int(np.clip(BASE_SPEED - correction, MIN_PWM, MAX_PWM))
 
                 controller.send_pwm(pwm_l, pwm_r)
                 
