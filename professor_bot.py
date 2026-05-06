@@ -78,7 +78,10 @@ class RobotController:
         print("[SISTEMA] Conexão encerrada e arquivos salvos.")
 
 def setup_camera() -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(0)
+    """Configura a câmera forçando o backend nativo do Linux (V4L2)."""
+    # Adicionada a flag cv2.CAP_V4L2
+    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     
