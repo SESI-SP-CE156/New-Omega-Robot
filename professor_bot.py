@@ -22,7 +22,7 @@ KP = 0.8  # Ganho Proporcional
 # ==========================================
 CAM_WIDTH = 640   
 CAM_HEIGHT = 480  
-CAM_FPS = 30
+CAM_FPS = 10      # Reduzido de 30 para 10 FPS
 CAM_FOV_DEGREES = 90
 
 BLIND_SPOT_CM = 6.0      
@@ -81,7 +81,9 @@ def setup_camera() -> cv2.VideoCapture:
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+    
+    # Solicita a mudança para o hardware (nem todas as câmeras respeitam)
+    cap.set(cv2.CAP_PROP_FPS, CAM_FPS) 
     
     if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'):
         cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
@@ -125,17 +127,22 @@ def main() -> None:
 
     print("==================================================")
     print(f"[INIT] Sistema de Visão Iniciado.")
+    print(f"[INIT] Câmera configurada para: {CAM_FPS} FPS.")
     print(f"[INIT] Delay compensatório: {DELAY_FRAMES} frames.")
     print(f"[INIT] Área Útil (Deadzone): +/- {int(DEADZONE_PX)} pixels.")
     print("==================================================\n")
 
     HEADLESS_MODE = False 
-    
-    # Variável para rastrear a última decisão e evitar spam no console
     last_decision_log = None 
+
+    # Intervalo alvo para manter exatos 10 FPS (1.0 segundo / 10 = 0.1s por frame)
+    target_frame_time = 1.0 / CAM_FPS
 
     try:
         while True:
+            # Inicia o cronômetro do frame
+            loop_start_time = time.time()
+
             ret, frame = cap.read()
             if not ret: 
                 break
@@ -156,7 +163,6 @@ def main() -> None:
                 controller.send_pwm(pwm_l, pwm_r)
                 controller.save_data(frame, pwm_l, pwm_r, label)
                 
-                # LOGGING: Imprime apenas se a decisão atual for diferente da anterior
                 if label != last_decision_log:
                     if label == "F":
                         print(f"[{time.strftime('%H:%M:%S')}] [AÇÃO] Linha na área útil. Andando para FRENTE (PWM: {pwm_l}/{pwm_r}).")
@@ -169,7 +175,6 @@ def main() -> None:
             else:
                 controller.send_pwm(0, 0)
                 
-                # LOGGING: Alerta de perda de linha
                 if last_decision_log != "LOST":
                     print(f"[{time.strftime('%H:%M:%S')}] [ALERTA CRÍTICO] Linha perdida! Motores parados por segurança.")
                     last_decision_log = "LOST"
@@ -190,6 +195,15 @@ def main() -> None:
                 if cv2.waitKey(1) & 0xFF == ord('q'): 
                     print("\n[SISTEMA] Desligamento solicitado pelo usuário.")
                     break
+
+            # ==========================================
+            # CONTROLE DE CADÊNCIA (FPS THROTTLE)
+            # ==========================================
+            processing_time = time.time() - loop_start_time
+            # Se o processamento for mais rápido que o tempo limite do frame, o sistema "dorme" a diferença
+            if processing_time < target_frame_time:
+                time.sleep(target_frame_time - processing_time)
+
     finally:
         controller.close()
         cap.release()
