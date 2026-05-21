@@ -215,7 +215,7 @@ def main() -> None:
     target_frame_time = 1.0 / CAM_FPS
 
     # Instância do PID. Ajuste estes valores na arena durante a calibração física.
-    pid = PIDController(kp=0.0, ki=0.0, kd=0.0)
+    pid = PIDController(kp=0.2, ki=0.0, kd=0.0)
 
     try:
         while True:
