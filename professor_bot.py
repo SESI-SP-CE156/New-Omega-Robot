@@ -12,8 +12,8 @@ from typing import Tuple, Optional
 SERIAL_PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 MAX_PWM = 140
-MIN_PWM = 140
-BASE_SPEED = 140
+MIN_PWM = 100
+BASE_SPEED = 120
 
 # ==========================================
 # CONFIGURAÇÕES DA CÂMERA E GEOMETRIA
