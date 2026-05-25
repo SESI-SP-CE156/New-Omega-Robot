@@ -1,6 +1,13 @@
 """
-Módulo Principal de Visão e Controle - OBR
+Módulo Principal de Visão e Controle - OBR (Olimpíada Brasileira de Robótica)
 Este script atua como o "cérebro" de alto nível rodando no Raspberry Pi 5.
+
+Responsabilidades Arquiteturais:
+1. Visão Computacional: Processamento de imagem em tempo real para extração de features (linhas e cores).
+2. Controle PID: Cálculo matemático para manter o robô centralizado na linha.
+3. Máquina de Estados (FSM): Tomada de decisão baseada em eventos (Gaps, Marcadores Verdes, Fim de pista).
+4. Comunicação Hardware: Envio de comandos via Serial para o atuador de baixo nível (ESP32).
+5. Coleta de Dados: Salvamento de frames e ações para futuro treinamento de IA (Deep Learning).
 """
 
 import cv2
@@ -19,8 +26,12 @@ SERIAL_PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 
 MAX_PWM = 250
-MIN_MOTION_PWM = 110 
 BASE_SPEED = 140
+
+# ZONA MORTA MECÂNICA (Torque de Estol):
+# PWM abaixo de 110 não tem força para vencer a inércia e o peso do robô.
+# Em vez de mandar um sinal fraco que só esquenta o motor, cortamos para 0 (Pivot).
+MIN_MOTION_PWM = 110 
 
 # ==========================================
 # CONFIGURAÇÕES DA CÂMERA E GEOMETRIA
@@ -33,14 +44,24 @@ CAM_FOV_DEGREES = 90
 BLIND_SPOT_CM = 6.0      
 TOLERANCE_CM = 5.0       
 
+# Cinemática Inversa Simples: Converte centímetros do mundo real para pixels na tela,
+# permitindo criar uma zona morta (Deadzone) baseada em medidas físicas reais.
 VISION_WIDTH_CM_AT_BLIND_SPOT = 2 * BLIND_SPOT_CM * np.tan(np.radians(CAM_FOV_DEGREES / 2))
 PIXELS_PER_CM = CAM_WIDTH / VISION_WIDTH_CM_AT_BLIND_SPOT
 DEADZONE_PX = (TOLERANCE_CM / 2) * PIXELS_PER_CM
 
+# ==========================================
+# CONFIGURAÇÕES DE COR (ESPAÇO HSV)
+# ==========================================
+# O espaço HSV (Matiz, Saturação, Brilho) é usado por ser muito mais 
+# resistente a variações de iluminação e sombras da arena do que o RGB.
+
 LOWER_GREEN = np.array([40, 50, 50])
 UPPER_GREEN = np.array([85, 255, 255])
-MIN_GREEN_AREA = 800 
+MIN_GREEN_AREA = 800 # Evita que pequenos ruídos na imagem sejam lidos como marcador
 
+# O vermelho fica no "grau zero" do cilindro de cores HSV, então ele vaza
+# para o final (180). Precisamos de duas máscaras para capturar o vermelho puro.
 LOWER_RED_1 = np.array([0, 70, 50])
 UPPER_RED_1 = np.array([10, 255, 255])
 LOWER_RED_2 = np.array([170, 70, 50])
@@ -50,38 +71,49 @@ MIN_RED_AREA = 1500
 # ==========================================
 # GESTÃO DE SESSÃO E DADOS (DATASET)
 # ==========================================
+# Isolamento de sessões por timestamp para evitar perda de dados de treinos anteriores
 SESSION_DIR = f"data/sessao_{int(time.time())}"
 os.makedirs(f"{SESSION_DIR}/images", exist_ok=True)
 
 class RobotState(Enum):
-    FOLLOWING_LINE = auto()
-    HANDLING_GAP = auto()
-    ALIGNING_TURN = auto()  
-    EXECUTING_TURN = auto() 
-    APPROACHING_FINISH = auto() # NOVO: Robô enxergou o fim, mas anda para encaixar as rodas
-    COURSE_FINISHED = auto() 
-    STOPPED = auto()
+    """Enumeração dos comportamentos possíveis na Máquina de Estados Finitos (FSM)."""
+    FOLLOWING_LINE = auto()     # Comportamento padrão (Controle PID)
+    HANDLING_GAP = auto()       # Inércia reta temporária ao perder a linha
+    ALIGNING_TURN = auto()      # Avanço cego para alinhar o eixo da roda com a intersecção
+    EXECUTING_TURN = auto()     # Giro 90°/180° no próprio eixo (Pivot)
+    APPROACHING_FINISH = auto() # Solução de Frame-Skipping: Anda após ver o vermelho para alinhar a roda na fita
+    COURSE_FINISHED = auto()    # Missão concluída (Motores cortados)
+    STOPPED = auto()            # Falha crítica de navegação
 
 class PIDController:
+    """
+    Controlador Proporcional-Integral-Derivativo.
+    Responsável por calcular a correção de trajetória de forma fluida.
+    """
     def __init__(self, kp: float, ki: float, kd: float):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
+        self.kp = kp # Força de reação imediata ao erro
+        self.ki = ki # Correção de vícios de hardware ao longo do tempo
+        self.kd = kd # Amortecedor: evita que o robô balance (efeito pêndulo)
         
         self.prev_error = 0.0
         self.integral = 0.0
         self.last_time = time.time()
 
     def compute(self, error: float) -> float:
+        """Calcula o valor PWM de correção baseado no desvio do centro."""
         current_time = time.time()
         dt = current_time - self.last_time
         
+        # Proteção contra divisão por zero em loops ultra-rápidos
         if dt <= 0.0: dt = 1e-4  
 
         p_out = self.kp * error
+        
+        # Integral com Anti-Windup (Clip) para evitar acúmulo matemático infinito
         self.integral += error * dt
         self.integral = np.clip(self.integral, -100, 100) 
         i_out = self.ki * self.integral
+        
         derivative = (error - self.prev_error) / dt
         d_out = self.kd * derivative
 
@@ -91,6 +123,10 @@ class PIDController:
         return p_out + i_out + d_out
 
 class StateManager:
+    """
+    Gerenciador da Máquina de Estados (FSM).
+    Centraliza as regras da OBR, isolando a lógica de decisão da execução mecânica.
+    """
     def __init__(self, gap_timeout_s: float = 1.2):
         self.state = RobotState.FOLLOWING_LINE
         self.gap_timer_start = 0.0
@@ -99,14 +135,16 @@ class StateManager:
         self.turn_intent = "NONE"
         self.turn_timer_start = 0.0
         self.ALIGN_TIME_S = 1.25 
+        
+        # Tempo que o robô ignora a câmera ao iniciar uma curva para não
+        # travar lendo a própria linha da qual ele está tentando sair.
         self.BLIND_TURN_TIME_S = 0.95 
 
-        # NOVO: Tempo que o robô roda "cego" pra frente para colocar as rodas 
-        # fisicamente em cima da fita vermelha que a câmera viu lá na frente.
         self.finish_timer_start = 0.0
         self.FINISH_ALIGN_TIME_S = 0.45 
         
     def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
+        """Avalia as entradas sensoriais e transita entre os estados lógicos do robô."""
         current_time = time.time()
         
         match self.state:
@@ -126,6 +164,7 @@ class StateManager:
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha perdida! Iniciando inércia para atravessar o GAP.")
                     
             case RobotState.HANDLING_GAP:
+                # Vermelho possui prioridade máxima para evitar que linhas finais sejam confundidas com GAPs
                 if red_detected:
                     self.state = RobotState.APPROACHING_FINISH
                     self.finish_timer_start = current_time
@@ -146,6 +185,7 @@ class StateManager:
             case RobotState.EXECUTING_TURN:
                 time_in_turn = current_time - self.turn_timer_start
                 if time_in_turn > self.BLIND_TURN_TIME_S:
+                    # Avalia a retomada da linha apenas se estiver próximo ao centro geométrico
                     if cx_bottom is not None:
                         dist_to_center = abs(cx_bottom - center)
                         if dist_to_center < (DEADZONE_PX * 2): 
@@ -153,7 +193,6 @@ class StateManager:
                             self.turn_intent = "NONE"
                             print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Curva concluída!\n")
             
-            # NOVO: Conta o tempo até as rodas chegarem na linha
             case RobotState.APPROACHING_FINISH:
                 if (current_time - self.finish_timer_start) > self.FINISH_ALIGN_TIME_S:
                     self.state = RobotState.COURSE_FINISHED
@@ -167,6 +206,7 @@ class StateManager:
         return self.state
 
 class RobotController:
+    """Camada de I/O: Comunicação Serial com o ESP32 e gravação de dataset."""
     def __init__(self):
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
@@ -181,15 +221,18 @@ class RobotController:
         self.writer.writerow(["img_path", "pwm_l", "pwm_r", "label"])
 
     def send_pwm(self, left: int, right: int) -> None:
+        """Envia comandos proporcionais contínuos."""
         if self.ser:
             command = f"P,{right},{left}\n"
             self.ser.write(command.encode())
             
     def send_raw(self, command: str) -> None:
+        """Envia comandos discretos pré-programados na firmware (ex: M,L para Pivot)."""
         if self.ser:
             self.ser.write(f"{command}\n".encode())
 
     def save_data(self, frame: np.ndarray, l_pwm: int, r_pwm: int, label: str) -> None:
+        """Salva a imagem pareada com as decisões para futuro treinamento Neural."""
         timestamp = int(time.time() * 1000)
         img_name = f"img_{timestamp}.jpg"
         img_path = f"images/{img_name}"
@@ -197,6 +240,7 @@ class RobotController:
         self.writer.writerow([img_path, r_pwm, l_pwm, label])
 
     def close(self) -> None:
+        """Garante encerramento limpo para não corromper o arquivo de log."""
         self.log_file.close()
         if self.ser:
             self.send_pwm(0, 0)
@@ -204,20 +248,29 @@ class RobotController:
         print("[SISTEMA] Conexão encerrada e arquivos salvos.")
 
 def setup_camera() -> cv2.VideoCapture:
+    """Configura o hardware da câmera nativamente no Linux (V4L2)."""
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAM_FPS) 
+    
+    # Previne que exposição e foco automáticos quebrem a leitura em tempo real
     if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'): cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
     if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'): cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
     return cap
 
 def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray, str, np.ndarray, bool]:
+    """
+    Pipeline unificado de Processamento de Visão Computacional.
+    Detecta Linha Preta (3 ROIs preditivas), Marcadores Verdes e Fita Vermelha.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY_INV)
 
     h, w = thresh.shape
+    
+    # Define as Regiões de Interesse (ROIs) para prever as curvas
     h_bottom_start, h_bottom_end = int(h * 0.70), h
     h_mid_start, h_mid_end = int(h * 0.40), int(h * 0.70)
     h_top_start, h_top_end = int(h * 0.10), int(h * 0.40)
@@ -235,8 +288,11 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     cx_mid = get_centroid(roi_mid)
     cx_top = get_centroid(roi_top)
 
+    # Conversão de Cor para os Marcadores
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask_green = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+    
+    # Processa os verdes apenas na metade inferior da tela
     mask_green_roi = mask_green[int(h*0.5):h, :]
     left_green = mask_green_roi[:, :w//2]
     right_green = mask_green_roi[:, w//2:]
@@ -253,8 +309,7 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     mask_red_2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
     mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
 
-    # CORREÇÃO: Voltamos a área vermelha para 30% da tela (0.70). 
-    # Isso garante que a linha SEMPRE seja detectada pela câmera antes de sumir
+    # A linha vermelha é processada na parte inferior (30% da tela) para evitar o Frame-Skipping
     mask_red_roi = mask_red[int(h * 0.70):h, :]
     red_area = cv2.countNonZero(mask_red_roi)
     red_detected = (red_area > MIN_RED_AREA)
@@ -262,9 +317,11 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     return cx_bottom, cx_mid, cx_top, w // 2, thresh, green_status, mask_green, red_detected
 
 def calculate_motor_speeds(correction: float, dynamic_base_speed: int) -> Tuple[int, int, str]:
+    """Soma a correção do PID à velocidade atual, aplicando restrições mecânicas."""
     pwm_l = dynamic_base_speed + correction
     pwm_r = dynamic_base_speed - correction
     
+    # Aplicação do Pivot forçado se o valor não vencer a inércia do motor
     if pwm_l < MIN_MOTION_PWM: pwm_l = 0
     if pwm_r < MIN_MOTION_PWM: pwm_r = 0
         
@@ -300,20 +357,25 @@ def main() -> None:
             cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green, red_detected = process_vision(frame)
             line_detected = (cx_bottom is not None) or (cx_mid is not None)
             
+            # Delega a decisão de Estado para a FSM
             current_state = state_manager.update(line_detected, green_status, cx_bottom, center, red_detected)
 
+            # Executa o comportamento físico baseado no Estado Lógico
             match current_state:
                 case RobotState.FOLLOWING_LINE:
                     current_error = 0
                     dynamic_base_speed = BASE_SPEED
 
+                    # Prioriza a ROI mais próxima do chassi (Bottom)
                     if cx_bottom is not None: current_error = cx_bottom - center
                     elif cx_mid is not None: current_error = cx_mid - center
 
+                    # Freio Inteligente Predivito: Olha a linha lá na frente (Top)
                     if cx_top is not None and cx_bottom is not None:
                         curve_intensity = abs(cx_top - cx_bottom)
                         if curve_intensity > 40: 
                             speed_reduction = min(60, curve_intensity * 0.4) 
+                            # Nunca deixa cair abaixo da força mecânica necessária para andar
                             dynamic_base_speed = max(MIN_MOTION_PWM, int(BASE_SPEED - speed_reduction))
 
                     if abs(current_error) < DEADZONE_PX: current_error = 0
@@ -327,36 +389,41 @@ def main() -> None:
                     if label != last_decision_log: last_decision_log = label
                         
                 case RobotState.HANDLING_GAP:
+                    # Em um GAP, zera a memória integral e mantém velocidade constante
                     pid.integral = 0 
                     safe_gap_speed = max(MIN_MOTION_PWM, BASE_SPEED - 20)
                     controller.send_pwm(safe_gap_speed, safe_gap_speed)
                     controller.save_data(frame, safe_gap_speed, safe_gap_speed, "G")
                     
                 case RobotState.ALIGNING_TURN:
+                    # Segue em frente momentaneamente para não virar antes da hora e bater
                     pid.integral = 0
                     align_speed = max(MIN_MOTION_PWM, BASE_SPEED - 10)
                     controller.send_pwm(align_speed, align_speed)
                     controller.save_data(frame, align_speed, align_speed, "T")
                     
                 case RobotState.EXECUTING_TURN:
+                    # Execução do movimento discreto via firmware, sem salvar frames borrados
                     pid.integral = 0
                     if state_manager.turn_intent == "LEFT": controller.send_raw("M,L")
                     elif state_manager.turn_intent == "RIGHT": controller.send_raw("M,R")
                     elif state_manager.turn_intent == "BOTH": controller.send_raw("M,REV")
 
-                # NOVO: Rotina para frear exatamente em cima da linha
                 case RobotState.APPROACHING_FINISH:
+                    # Anda os centímetros finais faltantes para subir na plataforma vermelha
                     pid.integral = 0
                     align_speed = max(MIN_MOTION_PWM, BASE_SPEED - 20)
                     controller.send_pwm(align_speed, align_speed)
-                    controller.save_data(frame, align_speed, align_speed, "F") # 'F' de Finish!
+                    controller.save_data(frame, align_speed, align_speed, "F")
 
                 case RobotState.COURSE_FINISHED:
+                    # Parada definitiva do sistema
                     pid.integral = 0
                     controller.send_pwm(0, 0)
                     controller.save_data(frame, 0, 0, "END")
 
                 case RobotState.STOPPED:
+                    # Parada de emergência (Linha perdida)
                     pid.integral = 0
                     controller.send_pwm(0, 0)
                     last_decision_log = "LOST"
@@ -375,6 +442,7 @@ def main() -> None:
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'): break
 
+            # Throttle de Processamento: Mantém cravado nos FPS definidos (ex: 10 FPS)
             processing_time = time.time() - loop_start_time
             if processing_time < target_frame_time: time.sleep(target_frame_time - processing_time)
 
