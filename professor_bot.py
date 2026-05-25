@@ -37,19 +37,15 @@ VISION_WIDTH_CM_AT_BLIND_SPOT = 2 * BLIND_SPOT_CM * np.tan(np.radians(CAM_FOV_DE
 PIXELS_PER_CM = CAM_WIDTH / VISION_WIDTH_CM_AT_BLIND_SPOT
 DEADZONE_PX = (TOLERANCE_CM / 2) * PIXELS_PER_CM
 
-# Configurações de Cor para os Marcadores (HSV)
-# Ajuste esses valores dependendo da luz da arena. Estes são padrões para verde.
 LOWER_GREEN = np.array([40, 50, 50])
 UPPER_GREEN = np.array([85, 255, 255])
-# Quantidade mínima de pixels verdes juntos para não confundir com ruído
 MIN_GREEN_AREA = 800 
 
-# Configurações de Cor para a Linha Vermelha (HSV wrap-around)
 LOWER_RED_1 = np.array([0, 70, 50])
 UPPER_RED_1 = np.array([10, 255, 255])
 LOWER_RED_2 = np.array([170, 70, 50])
 UPPER_RED_2 = np.array([180, 255, 255])
-MIN_RED_AREA = 1500 # Área maior, pois a linha vermelha cruza a tela toda
+MIN_RED_AREA = 1500 
 
 # ==========================================
 # GESTÃO DE SESSÃO E DADOS (DATASET)
@@ -60,13 +56,13 @@ os.makedirs(f"{SESSION_DIR}/images", exist_ok=True)
 class RobotState(Enum):
     FOLLOWING_LINE = auto()
     HANDLING_GAP = auto()
-    ALIGNING_TURN = auto()  # Anda reto um pouco para posicionar o eixo no cruzamento
-    EXECUTING_TURN = auto() # Gira freneticamente no eixo até achar a linha de novo
-    COURSE_FINISHED = auto() # Novo estado para a linha vermelha
+    ALIGNING_TURN = auto()  
+    EXECUTING_TURN = auto() 
+    APPROACHING_FINISH = auto() # NOVO: Robô enxergou o fim, mas anda para encaixar as rodas
+    COURSE_FINISHED = auto() 
     STOPPED = auto()
 
 class PIDController:
-    """Controlador Proporcional-Integral-Derivativo (PID)."""
     def __init__(self, kp: float, ki: float, kd: float):
         self.kp = kp
         self.ki = ki
@@ -80,15 +76,12 @@ class PIDController:
         current_time = time.time()
         dt = current_time - self.last_time
         
-        if dt <= 0.0:
-            dt = 1e-4  
+        if dt <= 0.0: dt = 1e-4  
 
         p_out = self.kp * error
-
         self.integral += error * dt
         self.integral = np.clip(self.integral, -100, 100) 
         i_out = self.ki * self.integral
-
         derivative = (error - self.prev_error) / dt
         d_out = self.kd * derivative
 
@@ -98,10 +91,6 @@ class PIDController:
         return p_out + i_out + d_out
 
 class StateManager:
-    """
-    Gerenciador da Máquina de Estados Finitos (FSM).
-    Responsável por transitar entre rastreio, inércia (gap), curvas complexas (verdes) e fim (vermelho).
-    """
     def __init__(self, gap_timeout_s: float = 1.2):
         self.state = RobotState.FOLLOWING_LINE
         self.gap_timer_start = 0.0
@@ -111,6 +100,11 @@ class StateManager:
         self.turn_timer_start = 0.0
         self.ALIGN_TIME_S = 1.25 
         self.BLIND_TURN_TIME_S = 0.95 
+
+        # NOVO: Tempo que o robô roda "cego" pra frente para colocar as rodas 
+        # fisicamente em cima da fita vermelha que a câmera viu lá na frente.
+        self.finish_timer_start = 0.0
+        self.FINISH_ALIGN_TIME_S = 0.45 
         
     def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
         current_time = time.time()
@@ -118,8 +112,9 @@ class StateManager:
         match self.state:
             case RobotState.FOLLOWING_LINE:
                 if red_detected:
-                    self.state = RobotState.COURSE_FINISHED
-                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha detectada! Fim do trajeto.")
+                    self.state = RobotState.APPROACHING_FINISH
+                    self.finish_timer_start = current_time
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha na visão! Aproximando para frear...")
                 elif green_status != "NONE":
                     self.turn_intent = green_status
                     self.state = RobotState.ALIGNING_TURN
@@ -131,10 +126,10 @@ class StateManager:
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha perdida! Iniciando inércia para atravessar o GAP.")
                     
             case RobotState.HANDLING_GAP:
-                # CORREÇÃO: Prioridade Máxima para a Linha Vermelha mesmo durante o GAP!
                 if red_detected:
-                    self.state = RobotState.COURSE_FINISHED
-                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha detectada durante o GAP! Fim do trajeto.")
+                    self.state = RobotState.APPROACHING_FINISH
+                    self.finish_timer_start = current_time
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha detectada no meio do GAP! Aproximando para frear...")
                 elif line_detected:
                     self.state = RobotState.FOLLOWING_LINE
                     print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] GAP superado! Retomando rastreio PID.\n")
@@ -157,7 +152,13 @@ class StateManager:
                             self.state = RobotState.FOLLOWING_LINE
                             self.turn_intent = "NONE"
                             print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Curva concluída!\n")
-                            
+            
+            # NOVO: Conta o tempo até as rodas chegarem na linha
+            case RobotState.APPROACHING_FINISH:
+                if (current_time - self.finish_timer_start) > self.FINISH_ALIGN_TIME_S:
+                    self.state = RobotState.COURSE_FINISHED
+                    print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Posição final alcançada. Desligando motores.")
+
             case RobotState.STOPPED:
                 if line_detected:
                     self.state = RobotState.FOLLOWING_LINE
@@ -166,7 +167,6 @@ class StateManager:
         return self.state
 
 class RobotController:
-    """Gerencia a comunicação de hardware (ESP32) e a persistência de dados."""
     def __init__(self):
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
@@ -181,13 +181,11 @@ class RobotController:
         self.writer.writerow(["img_path", "pwm_l", "pwm_r", "label"])
 
     def send_pwm(self, left: int, right: int) -> None:
-        """Envia pacote P para aplicar PWM contínuo."""
         if self.ser:
             command = f"P,{right},{left}\n"
             self.ser.write(command.encode())
             
     def send_raw(self, command: str) -> None:
-        """Envia pacotes complexos, como os de comando discreto M (Pivot) ou G."""
         if self.ser:
             self.ser.write(f"{command}\n".encode())
 
@@ -195,7 +193,6 @@ class RobotController:
         timestamp = int(time.time() * 1000)
         img_name = f"img_{timestamp}.jpg"
         img_path = f"images/{img_name}"
-        
         cv2.imwrite(f"{SESSION_DIR}/{img_path}", frame)
         self.writer.writerow([img_path, r_pwm, l_pwm, label])
 
@@ -211,19 +208,11 @@ def setup_camera() -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAM_FPS) 
-    
-    if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'):
-        cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
-    if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'):
-        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-    
+    if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'): cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
+    if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'): cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
     return cap
 
 def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray, str, np.ndarray, bool]:
-    """
-    Retorna: (cx_bottom, cx_mid, cx_top, center_x, thresh_black, green_status, mask_green)
-    """
-    # ====== DETECÇÃO DA LINHA PRETA ======
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY_INV)
@@ -246,15 +235,9 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     cx_mid = get_centroid(roi_mid)
     cx_top = get_centroid(roi_top)
 
-    # ====== DETECÇÃO DOS MARCADORES VERDES (OBR) ======
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask_green = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-    
-    # O verde deve ser buscado na metade inferior da tela para não capturar 
-    # o cenário fora da arena ou camisas da arquibancada.
     mask_green_roi = mask_green[int(h*0.5):h, :]
-    
-    # Fatiamos verticalmente no meio para saber se o verde está na Esquerda ou Direita
     left_green = mask_green_roi[:, :w//2]
     right_green = mask_green_roi[:, w//2:]
     
@@ -262,25 +245,19 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     green_right_area = cv2.countNonZero(right_green)
     
     green_status = "NONE"
+    if green_left_area > MIN_GREEN_AREA and green_right_area > MIN_GREEN_AREA: green_status = "BOTH"
+    elif green_left_area > MIN_GREEN_AREA: green_status = "LEFT"
+    elif green_right_area > MIN_GREEN_AREA: green_status = "RIGHT"
 
-    # Lógica baseada em área. Se os dois lados possuem muitos pixels verdes, é Retorno de 180°
-    if green_left_area > MIN_GREEN_AREA and green_right_area > MIN_GREEN_AREA:
-        green_status = "BOTH"
-    elif green_left_area > MIN_GREEN_AREA:
-        green_status = "LEFT"
-    elif green_right_area > MIN_GREEN_AREA:
-        green_status = "RIGHT"
-
-    # ====== DETECÇÃO DA LINHA VERMELHA (PARADA) ======
     mask_red_1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
     mask_red_2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
     mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
 
-    # Focamos no centro inferior da tela para ter certeza de que a linha 
-    # vermelha está no chão, bem debaixo do robô
-    mask_red_roi = mask_red[int(h * 0.90):h, :]
+    # CORREÇÃO: Voltamos a área vermelha para 30% da tela (0.70). 
+    # Isso garante que a linha SEMPRE seja detectada pela câmera antes de sumir
+    mask_red_roi = mask_red[int(h * 0.70):h, :]
     red_area = cv2.countNonZero(mask_red_roi)
-    red_detected = (red_area > 800)
+    red_detected = (red_area > MIN_RED_AREA)
 
     return cx_bottom, cx_mid, cx_top, w // 2, thresh, green_status, mask_green, red_detected
 
@@ -294,10 +271,8 @@ def calculate_motor_speeds(correction: float, dynamic_base_speed: int) -> Tuple[
     pwm_l = int(np.clip(pwm_l, 0, MAX_PWM))
     pwm_r = int(np.clip(pwm_r, 0, MAX_PWM))
     
-    if abs(correction) < 20: 
-        label = "F"
-    else:
-        label = "R" if correction > 0 else "L"
+    if abs(correction) < 20: label = "F"
+    else: label = "R" if correction > 0 else "L"
         
     return pwm_l, pwm_r, label
 
@@ -322,27 +297,18 @@ def main() -> None:
             ret, frame = cap.read()
             if not ret: break
 
-            # CORREÇÃO: Apenas UMA chamada para process_vision, recebendo todas as variáveis
             cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green, red_detected = process_vision(frame)
-            
-            # CORREÇÃO: Retornamos a variável line_detected que havia sido apagada
             line_detected = (cx_bottom is not None) or (cx_mid is not None)
             
-            # Atualiza o estado
             current_state = state_manager.update(line_detected, green_status, cx_bottom, center, red_detected)
 
             match current_state:
-                
                 case RobotState.FOLLOWING_LINE:
-                    # CORREÇÃO: Limpamos os ifs daqui. Se a FSM disse que é FOLLOWING_LINE, 
-                    # apenas executamos o PID puro!
                     current_error = 0
                     dynamic_base_speed = BASE_SPEED
 
-                    if cx_bottom is not None:
-                        current_error = cx_bottom - center
-                    elif cx_mid is not None:
-                        current_error = cx_mid - center
+                    if cx_bottom is not None: current_error = cx_bottom - center
+                    elif cx_mid is not None: current_error = cx_mid - center
 
                     if cx_top is not None and cx_bottom is not None:
                         curve_intensity = abs(cx_top - cx_bottom)
@@ -350,8 +316,7 @@ def main() -> None:
                             speed_reduction = min(60, curve_intensity * 0.4) 
                             dynamic_base_speed = max(MIN_MOTION_PWM, int(BASE_SPEED - speed_reduction))
 
-                    if abs(current_error) < DEADZONE_PX:
-                        current_error = 0
+                    if abs(current_error) < DEADZONE_PX: current_error = 0
 
                     correction = pid.compute(current_error)
                     pwm_l, pwm_r, label = calculate_motor_speeds(correction, dynamic_base_speed)
@@ -359,8 +324,7 @@ def main() -> None:
                     controller.send_pwm(pwm_l, pwm_r)
                     controller.save_data(frame, pwm_l, pwm_r, label)
 
-                    if label != last_decision_log:
-                        last_decision_log = label
+                    if label != last_decision_log: last_decision_log = label
                         
                 case RobotState.HANDLING_GAP:
                     pid.integral = 0 
@@ -369,44 +333,34 @@ def main() -> None:
                     controller.save_data(frame, safe_gap_speed, safe_gap_speed, "G")
                     
                 case RobotState.ALIGNING_TURN:
-                    # Durante o alinhamento, ignora o erro e apenas segue em frente para cruzar a área verde
                     pid.integral = 0
                     align_speed = max(MIN_MOTION_PWM, BASE_SPEED - 10)
                     controller.send_pwm(align_speed, align_speed)
-                    
-                    # Rotula no dataset como 'T' (Turn Setup) para não poluir os dados de frente normal
                     controller.save_data(frame, align_speed, align_speed, "T")
                     
                 case RobotState.EXECUTING_TURN:
-                    # Não salvamos imagens durante o pivot para não poluir o dataset de AI 
-                    # com imagens super borradas que ele não deve tentar imitar
                     pid.integral = 0
-                    
-                    # Manda o comando da firmware do Arduino (New-Omega.ino)
-                    if state_manager.turn_intent == "LEFT":
-                        controller.send_raw("M,L")
-                    elif state_manager.turn_intent == "RIGHT":
-                        controller.send_raw("M,R")
-                    elif state_manager.turn_intent == "BOTH":
-                        # Giro 180 usa um lado fixo até achar a linha traseira
-                        controller.send_raw("M,REV")
+                    if state_manager.turn_intent == "LEFT": controller.send_raw("M,L")
+                    elif state_manager.turn_intent == "RIGHT": controller.send_raw("M,R")
+                    elif state_manager.turn_intent == "BOTH": controller.send_raw("M,REV")
+
+                # NOVO: Rotina para frear exatamente em cima da linha
+                case RobotState.APPROACHING_FINISH:
+                    pid.integral = 0
+                    align_speed = max(MIN_MOTION_PWM, BASE_SPEED - 20)
+                    controller.send_pwm(align_speed, align_speed)
+                    controller.save_data(frame, align_speed, align_speed, "F") # 'F' de Finish!
+
+                case RobotState.COURSE_FINISHED:
+                    pid.integral = 0
+                    controller.send_pwm(0, 0)
+                    controller.save_data(frame, 0, 0, "END")
 
                 case RobotState.STOPPED:
                     pid.integral = 0
                     controller.send_pwm(0, 0)
                     last_decision_log = "LOST"
-                
-                case RobotState.COURSE_FINISHED:
-                    # Trava definitiva. O robô não tenta mais voltar para FOLLOWING_LINE
-                    pid.integral = 0
-                    controller.send_pwm(0, 0)
-                    
-                    # Anotamos isso no dataset como 'END'
-                    controller.save_data(frame, 0, 0, "END")
 
-            # ==========================================
-            # DEBUG E VISUALIZAÇÃO
-            # ==========================================
             if not HEADLESS_MODE:
                 cv2.line(frame, (int(center - DEADZONE_PX), 0), (int(center - DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 1)
                 cv2.line(frame, (int(center + DEADZONE_PX), 0), (int(center + DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 1)
@@ -419,13 +373,10 @@ def main() -> None:
                 cv2.imshow("Sistema de Visao - Mascara Verde", mask_green)
                 cv2.imshow("Sistema de Visao - RGB", frame)
                 
-                if cv2.waitKey(1) & 0xFF == ord('q'): 
-                    break
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-            # Controle de Cadência de Frame (FPS)
             processing_time = time.time() - loop_start_time
-            if processing_time < target_frame_time:
-                time.sleep(target_frame_time - processing_time)
+            if processing_time < target_frame_time: time.sleep(target_frame_time - processing_time)
 
     finally:
         controller.close()
