@@ -16,6 +16,7 @@ import time
 import csv
 import os
 from typing import Tuple, Optional
+from enum import Enum, auto
 
 # ==========================================
 # CONFIGURAÇÕES FÍSICAS E DE CONTROLE
@@ -57,6 +58,12 @@ DEADZONE_PX = (TOLERANCE_CM / 2) * PIXELS_PER_CM
 # Cria um diretório isolado por timestamp para evitar sobrescrever dados de treinos anteriores
 SESSION_DIR = f"data/sessao_{int(time.time())}"
 os.makedirs(f"{SESSION_DIR}/images", exist_ok=True)
+
+class RobotState(Enum):
+    """Mapeia os estados comportamentais da Máquina de Estados Finitos (FSM)."""
+    FOLLOWING_LINE = auto()
+    HANDLING_GAP = auto()
+    STOPPED = auto()
 
 class PIDController:
     """
@@ -100,6 +107,43 @@ class PIDController:
         self.last_time = current_time
 
         return p_out + i_out + d_out
+
+class StateManager:
+    """
+    Gerencia as transições de estado do robô (Máquina de Estados Finitos).
+    Isola a lógica comportamental (as regras da OBR) das lógicas de controle (PID) e hardware.
+    """
+    def __init__(self, gap_timeout_s: float = 1.2):
+        self.state = RobotState.FOLLOWING_LINE
+        self.gap_timer_start = 0.0
+        # Tempo máximo permitido andando "às cegas" para tentar superar o GAP
+        self.gap_timeout_s = gap_timeout_s 
+        
+    def update(self, line_detected: bool) -> RobotState:
+        current_time = time.time()
+        
+        match self.state:
+            case RobotState.FOLLOWING_LINE:
+                if not line_detected:
+                    self.state = RobotState.HANDLING_GAP
+                    self.gap_timer_start = current_time
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha perdida! Iniciando inércia para atravessar o GAP.")
+                    
+            case RobotState.HANDLING_GAP:
+                if line_detected:
+                    self.state = RobotState.FOLLOWING_LINE
+                    print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] GAP superado! Retomando rastreio PID.\n")
+                elif (current_time - self.gap_timer_start) > self.gap_timeout_s:
+                    self.state = RobotState.STOPPED
+                    print(f"[{time.strftime('%H:%M:%S')}] [ALERTA CRÍTICO] Tempo de inércia esgotado. Nenhuma linha encontrada após o GAP.")
+                    
+            case RobotState.STOPPED:
+                # Caso a linha volte a aparecer (alguém reposicionou o robô na pista)
+                if line_detected:
+                    self.state = RobotState.FOLLOWING_LINE
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha detectada novamente. Retomando missão.")
+                    
+        return self.state
 
 class RobotController:
     """
@@ -232,23 +276,20 @@ def calculate_motor_speeds(correction: float, dynamic_base_speed: int) -> Tuple[
     return pwm_l, pwm_r, label
 
 def main() -> None:
-    # 1. Inicialização de Periféricos
+    # 1. Inicialização de Periféricos e Lógica
     cap = setup_camera()
     controller = RobotController()
+    state_manager = StateManager(gap_timeout_s=1.2) # Ajuste esse tempo se o GAP físico for muito longo
+    pid = PIDController(kp=5.0, ki=0.0, kd=0.0)
 
     print("==================================================")
-    print(f"[INIT] Sistema de Visão Iniciado.")
-    print(f"[INIT] Câmera configurada para: {CAM_FPS} FPS.")
+    print(f"[INIT] Sistema de Visão e FSM Iniciados.")
     print(f"[INIT] Área Útil (Deadzone): +/- {int(DEADZONE_PX)} pixels.")
     print("==================================================\n")
 
-    # Flag para ocultar janelas do OpenCV caso esteja rodando diretamente no Pi sem monitor
     HEADLESS_MODE = True 
     last_decision_log = None 
-    target_frame_time = 1.0 / CAM_FPS # Tempo alvo por ciclo para manter os FPS cravados
-
-    # Instância do PID configurada empiricamente na pista física
-    pid = PIDController(kp=5.0, ki=0.0, kd=0.0)
+    target_frame_time = 1.0 / CAM_FPS 
 
     try:
         while True:
@@ -258,61 +299,64 @@ def main() -> None:
 
             # 2. Extração de Features Visuais
             cx_bottom, cx_mid, cx_top, center, thresh = process_vision(frame)
+            
+            # Uma linha é considerada "detectada" se pelo menos o meio ou a base a enxergarem
+            line_detected = (cx_bottom is not None) or (cx_mid is not None)
 
-            current_error = 0
-            dynamic_base_speed = BASE_SPEED
+            # 3. Atualização da Máquina de Estados
+            current_state = state_manager.update(line_detected)
 
-            # 3. Definição do Alvo (Prioridade inferior)
-            if cx_bottom is not None:
-                current_error = cx_bottom - center
-            elif cx_mid is not None:
-                current_error = cx_mid - center
+            # 4. Execução do Comportamento baseado no Estado
+            match current_state:
+                
+                case RobotState.FOLLOWING_LINE:
+                    current_error = 0
+                    dynamic_base_speed = BASE_SPEED
 
-            # 4. Freio Inteligente (Visão Preditiva)
-            # Analisa o quão "torta" está a linha comparando a base com o topo da imagem
-            if cx_top is not None and cx_bottom is not None:
-                curve_intensity = abs(cx_top - cx_bottom)
-                if curve_intensity > 40: # Threshold de curva agressiva
-                    speed_reduction = min(60, curve_intensity * 0.4) 
+                    # Rastreio da linha
+                    if cx_bottom is not None:
+                        current_error = cx_bottom - center
+                    elif cx_mid is not None:
+                        current_error = cx_mid - center
+
+                    # Freio Inteligente (Visão Preditiva)
+                    if cx_top is not None and cx_bottom is not None:
+                        curve_intensity = abs(cx_top - cx_bottom)
+                        if curve_intensity > 40: 
+                            speed_reduction = min(60, curve_intensity * 0.4) 
+                            dynamic_base_speed = max(MIN_MOTION_PWM, int(BASE_SPEED - speed_reduction))
+
+                    if abs(current_error) < DEADZONE_PX:
+                        current_error = 0
+
+                    correction = pid.compute(current_error)
+                    pwm_l, pwm_r, label = calculate_motor_speeds(correction, dynamic_base_speed)
                     
-                    # O robô freia para entrar suave na curva, MAS nunca abaixo da Zona Morta,
-                    # garantindo que ele tenha força mecânica para sair da inércia e fazer o giro.
-                    dynamic_base_speed = max(MIN_MOTION_PWM, int(BASE_SPEED - speed_reduction))
+                    controller.send_pwm(pwm_l, pwm_r)
+                    controller.save_data(frame, pwm_l, pwm_r, label)
 
-            # 5. Aplicação da Zona Morta Visual
-            if abs(current_error) < DEADZONE_PX:
-                current_error = 0
-
-            # 6. Atuação e Logging
-            if cx_bottom is not None or cx_mid is not None:
-                # Calcula a atuação, converte para PWM com segurança e envia para o ESP32
-                correction = pid.compute(current_error)
-                pwm_l, pwm_r, label = calculate_motor_speeds(correction, dynamic_base_speed)
-                
-                controller.send_pwm(pwm_l, pwm_r)
-                controller.save_data(frame, pwm_l, pwm_r, label)
-                
-                # Previne poluição no terminal, logando apenas mudanças de estado
-                if label != last_decision_log:
-                    if label == "F":
-                        print(f"[{time.strftime('%H:%M:%S')}] [AÇÃO] Linha na área útil. Andando para FRENTE (PWM: {pwm_l}/{pwm_r}).")
-                    elif label == "R":
-                        print(f"[{time.strftime('%H:%M:%S')}] [AÇÃO] Corrigindo posição para a DIREITA (PWM Esq: {pwm_l}, Dir: {pwm_r}).")
-                    elif label == "L":
-                        print(f"[{time.strftime('%H:%M:%S')}] [AÇÃO] Corrigindo posição para a ESQUERDA (PWM Esq: {pwm_l}, Dir: {pwm_r}).")
-                    last_decision_log = label
-
-            else:
-                # 7. Segurança: Sistema à deriva
-                pid.integral = 0 # Reseta histórico do PID para não reagir bruscamente depois
-                controller.send_pwm(0, 0) # Corta motores instantaneamente
-                
-                if last_decision_log != "LOST":
-                    print(f"[{time.strftime('%H:%M:%S')}] [ALERTA CRÍTICO] Linha perdida! Motores parados por segurança.")
+                    if label != last_decision_log:
+                        last_decision_log = label
+                        
+                case RobotState.HANDLING_GAP:
+                    # Durante um GAP, o robô ignora o PID e "congela" a direção para frente.
+                    # Congelar a integral evita que o PID "acumule" erro invisível e dê um tranco ao voltar.
+                    pid.integral = 0 
+                    
+                    # Usa uma velocidade ligeiramente reduzida para manter tração constante sem derrapar
+                    safe_gap_speed = max(MIN_MOTION_PWM, BASE_SPEED - 20)
+                    
+                    # O label 'G' anota isso no dataset para que a IA aprenda o conceito de inércia
+                    controller.send_pwm(safe_gap_speed, safe_gap_speed)
+                    controller.save_data(frame, safe_gap_speed, safe_gap_speed, "G")
+                    
+                case RobotState.STOPPED:
+                    pid.integral = 0
+                    controller.send_pwm(0, 0)
                     last_decision_log = "LOST"
 
             # ==========================================
-            # DEBUG E VISUALIZAÇÃO (Somente se HEADLESS_MODE = False)
+            # DEBUG E VISUALIZAÇÃO
             # ==========================================
             if not HEADLESS_MODE:
                 cv2.line(frame, (int(center - DEADZONE_PX), 0), (int(center - DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 1)
@@ -325,21 +369,15 @@ def main() -> None:
                 cv2.imshow("Sistema de Visao - Binarizado", thresh)
                 cv2.imshow("Sistema de Visao - RGB", frame)
                 
-                # Captura tecla 'q' para saída manual
                 if cv2.waitKey(1) & 0xFF == ord('q'): 
                     break
 
-            # ==========================================
-            # CONTROLE DE CADÊNCIA (THROTTLE DE FPS)
-            # ==========================================
-            # Força o laço a rodar em exatamente 10 FPS, colocando a thread para dormir o resto do tempo.
-            # Isso gera imagens limpas sem arrasto de movimento para a IA.
+            # Controle de Cadência de Frame (FPS)
             processing_time = time.time() - loop_start_time
             if processing_time < target_frame_time:
                 time.sleep(target_frame_time - processing_time)
 
     finally:
-        # Bloco finally garante encerramento limpo (motores parados) caso o usuário aperte Ctrl+C
         controller.close()
         cap.release()
         cv2.destroyAllWindows()
