@@ -1,12 +1,6 @@
 """
 Módulo Principal de Visão e Controle - OBR
 Este script atua como o "cérebro" de alto nível rodando no Raspberry Pi 5.
-Responsabilidades:
-1. Capturar e processar imagens da câmera (visão computacional).
-2. Calcular correções de trajetória usando controle PID e visão preditiva (3 ROIs).
-3. Gerenciar o problema mecânico de Zona Morta (Estol) dos motores.
-4. Enviar comandos de velocidade (PWM) via Serial para o ESP32 (atuador de baixo nível).
-5. Gravar os frames e decisões em um dataset (CSV) para o futuro treinamento de IA (AI HAT+).
 """
 
 import cv2
@@ -24,12 +18,7 @@ from enum import Enum, auto
 SERIAL_PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 
-# Limite máximo de segurança para a Ponte-H e os motores
 MAX_PWM = 250
-
-# ZONA MORTA MECÂNICA (Torque de Estol): 
-# Valor mínimo de PWM necessário para vencer o atrito estático do motor e mover o peso do robô.
-# Valores abaixo deste apenas aquecerão o motor sem gerar movimento.
 MIN_MOTION_PWM = 110 
 BASE_SPEED = 140
 
@@ -41,38 +30,35 @@ CAM_HEIGHT = 480
 CAM_FPS = 10      
 CAM_FOV_DEGREES = 90
 
-# Distância do ponto cego (chassi tapando a visão) e tolerância de erro
 BLIND_SPOT_CM = 6.0      
 TOLERANCE_CM = 5.0       
 
-# Cinemática Inversa simples: Calcula quantos pixels na tela representam 1 cm no mundo real
 VISION_WIDTH_CM_AT_BLIND_SPOT = 2 * BLIND_SPOT_CM * np.tan(np.radians(CAM_FOV_DEGREES / 2))
 PIXELS_PER_CM = CAM_WIDTH / VISION_WIDTH_CM_AT_BLIND_SPOT
-
-# Define a "Zona Morta" visual em pixels (área onde o robô é considerado centralizado)
 DEADZONE_PX = (TOLERANCE_CM / 2) * PIXELS_PER_CM
+
+# Configurações de Cor para os Marcadores (HSV)
+# Ajuste esses valores dependendo da luz da arena. Estes são padrões para verde.
+LOWER_GREEN = np.array([40, 50, 50])
+UPPER_GREEN = np.array([85, 255, 255])
+# Quantidade mínima de pixels verdes juntos para não confundir com ruído
+MIN_GREEN_AREA = 800 
 
 # ==========================================
 # GESTÃO DE SESSÃO E DADOS (DATASET)
 # ==========================================
-# Cria um diretório isolado por timestamp para evitar sobrescrever dados de treinos anteriores
 SESSION_DIR = f"data/sessao_{int(time.time())}"
 os.makedirs(f"{SESSION_DIR}/images", exist_ok=True)
 
 class RobotState(Enum):
-    """Mapeia os estados comportamentais da Máquina de Estados Finitos (FSM)."""
     FOLLOWING_LINE = auto()
     HANDLING_GAP = auto()
+    ALIGNING_TURN = auto()  # Anda reto um pouco para posicionar o eixo no cruzamento
+    EXECUTING_TURN = auto() # Gira freneticamente no eixo até achar a linha de novo
     STOPPED = auto()
 
 class PIDController:
-    """
-    Controlador Proporcional-Integral-Derivativo (PID).
-    Calcula a força necessária para corrigir o desvio do robô em relação à linha.
-    - P: Reage ao erro atual (Força principal).
-    - I: Corrige erros crônicos (ex: um motor mais fraco que o outro).
-    - D: Amortece o movimento, evitando que o robô balance feito um pêndulo.
-    """
+    """Controlador Proporcional-Integral-Derivativo (PID)."""
     def __init__(self, kp: float, ki: float, kd: float):
         self.kp = kp
         self.ki = ki
@@ -86,23 +72,18 @@ class PIDController:
         current_time = time.time()
         dt = current_time - self.last_time
         
-        # Trava de segurança para evitar divisão por zero
         if dt <= 0.0:
             dt = 1e-4  
 
-        # [Proporcional]
         p_out = self.kp * error
 
-        # [Integral] Acúmulo no tempo. Usa 'clip' como Anti-Windup para evitar crescimento infinito
         self.integral += error * dt
         self.integral = np.clip(self.integral, -100, 100) 
         i_out = self.ki * self.integral
 
-        # [Derivativo] Taxa de variação (velocidade com que o erro muda)
         derivative = (error - self.prev_error) / dt
         d_out = self.kd * derivative
 
-        # Salva o estado para o próximo cálculo
         self.prev_error = error
         self.last_time = current_time
 
@@ -110,21 +91,38 @@ class PIDController:
 
 class StateManager:
     """
-    Gerencia as transições de estado do robô (Máquina de Estados Finitos).
-    Isola a lógica comportamental (as regras da OBR) das lógicas de controle (PID) e hardware.
+    Gerenciador da Máquina de Estados Finitos (FSM).
+    Responsável por transitar entre rastreio, inércia (gap) e curvas complexas (verdes).
     """
     def __init__(self, gap_timeout_s: float = 1.2):
         self.state = RobotState.FOLLOWING_LINE
         self.gap_timer_start = 0.0
-        # Tempo máximo permitido andando "às cegas" para tentar superar o GAP
         self.gap_timeout_s = gap_timeout_s 
         
-    def update(self, line_detected: bool) -> RobotState:
+        # Variáveis exclusivas para cruzamentos verdes
+        self.turn_intent = "NONE"
+        self.turn_timer_start = 0.0
+        
+        # Tempo que o robô anda reto APÓS ver o verde para centralizar as rodas no cruzamento
+        self.ALIGN_TIME_S = 0.45 
+        
+        # Tempo cego: Ignora a câmera logo que começa a girar para não ser
+        # enganado pela própria linha de onde ele acabou de sair.
+        self.BLIND_TURN_TIME_S = 0.6 
+        
+    def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int) -> RobotState:
         current_time = time.time()
         
         match self.state:
             case RobotState.FOLLOWING_LINE:
-                if not line_detected:
+                if green_status != "NONE":
+                    # Gatilho do Marcador Verde! Salva a intenção e começa a alinhar.
+                    self.turn_intent = green_status
+                    self.state = RobotState.ALIGNING_TURN
+                    self.turn_timer_start = current_time
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Marcador Verde ({green_status}) detectado! Alinhando para a curva...")
+                    
+                elif not line_detected:
                     self.state = RobotState.HANDLING_GAP
                     self.gap_timer_start = current_time
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha perdida! Iniciando inércia para atravessar o GAP.")
@@ -136,9 +134,28 @@ class StateManager:
                 elif (current_time - self.gap_timer_start) > self.gap_timeout_s:
                     self.state = RobotState.STOPPED
                     print(f"[{time.strftime('%H:%M:%S')}] [ALERTA CRÍTICO] Tempo de inércia esgotado. Nenhuma linha encontrada após o GAP.")
+            
+            case RobotState.ALIGNING_TURN:
+                # Espera as rodas chegarem no centro geográfico da intersecção
+                if (current_time - self.turn_timer_start) > self.ALIGN_TIME_S:
+                    self.state = RobotState.EXECUTING_TURN
+                    self.turn_timer_start = current_time
+                    print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Posição alcançada! Executando Pivot de curva...")
                     
+            case RobotState.EXECUTING_TURN:
+                time_in_turn = current_time - self.turn_timer_start
+                
+                # Só começa a procurar a linha preta DEPOIS de passar o tempo cego
+                if time_in_turn > self.BLIND_TURN_TIME_S:
+                    if cx_bottom is not None:
+                        # Se achou a linha e ela está minimamente próxima ao centro, encerra o giro
+                        dist_to_center = abs(cx_bottom - center)
+                        if dist_to_center < (DEADZONE_PX * 2): # Margem um pouco maior para agarrar a linha
+                            self.state = RobotState.FOLLOWING_LINE
+                            self.turn_intent = "NONE"
+                            print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Curva verde concluída! Retomando linha.\n")
+                            
             case RobotState.STOPPED:
-                # Caso a linha volte a aparecer (alguém reposicionou o robô na pista)
                 if line_detected:
                     self.state = RobotState.FOLLOWING_LINE
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha detectada novamente. Retomando missão.")
@@ -146,34 +163,32 @@ class StateManager:
         return self.state
 
 class RobotController:
-    """
-    Gerencia a camada de I/O do sistema: 
-    1. Envio de comandos seriais para o firmware do ESP32.
-    2. Escrita do log (CSV) e salvamento de imagens para Deep Learning.
-    """
+    """Gerencia a comunicação de hardware (ESP32) e a persistência de dados."""
     def __init__(self):
-        # Tenta conectar com o microcontrolador ESP32
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-            time.sleep(2) # Aguarda o boot/reset automático do ESP ao abrir a serial
+            time.sleep(2) 
             print("[SISTEMA] Controlador conectado com sucesso.")
         except Exception as e:
             print(f"[AVISO] Erro ao conectar no microcontrolador: {e}")
             self.ser = None
 
-        # Inicializa o arquivo de anotações (labels) que alimentará a futura rede neural
         self.log_file = open(f"{SESSION_DIR}/labels.csv", mode='w', newline='')
         self.writer = csv.writer(self.log_file)
         self.writer.writerow(["img_path", "pwm_l", "pwm_r", "label"])
 
     def send_pwm(self, left: int, right: int) -> None:
-        """Monta o pacote de dados via protocolo de texto e despacha para o ESP32."""
+        """Envia pacote P para aplicar PWM contínuo."""
         if self.ser:
             command = f"P,{right},{left}\n"
             self.ser.write(command.encode())
+            
+    def send_raw(self, command: str) -> None:
+        """Envia pacotes complexos, como os de comando discreto M (Pivot) ou G."""
+        if self.ser:
+            self.ser.write(f"{command}\n".encode())
 
     def save_data(self, frame: np.ndarray, l_pwm: int, r_pwm: int, label: str) -> None:
-        """Persiste o frame capturado no disco e atrela a decisão correspondente no CSV."""
         timestamp = int(time.time() * 1000)
         img_name = f"img_{timestamp}.jpg"
         img_path = f"images/{img_name}"
@@ -182,7 +197,6 @@ class RobotController:
         self.writer.writerow([img_path, r_pwm, l_pwm, label])
 
     def close(self) -> None:
-        """Garante a parada física do robô e o fechamento íntegro dos arquivos ao sair."""
         self.log_file.close()
         if self.ser:
             self.send_pwm(0, 0)
@@ -190,17 +204,11 @@ class RobotController:
         print("[SISTEMA] Conexão encerrada e arquivos salvos.")
 
 def setup_camera() -> cv2.VideoCapture:
-    """
-    Inicia a câmera exigindo a API V4L2 nativa do Linux. 
-    Isso é crucial para que parâmetros de hardware (Anti-flicker e Exposição Manual) 
-    configurados no script 'setup_camera.sh' não sejam sobrescritos pelo OpenCV.
-    """
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAM_FPS) 
     
-    # Desativa recursos automáticos que causam oscilação na leitura da linha
     if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'):
         cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
     if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'):
@@ -208,66 +216,69 @@ def setup_camera() -> cv2.VideoCapture:
     
     return cap
 
-def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray]:
+def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray, str, np.ndarray]:
     """
-    Pipeline de Visão Computacional Clássica.
-    Fatia a imagem em 3 ROIs (Region of Interest) - Bottom, Mid e Top.
-    Isso simula 'profundidade' e permite que o robô saiba de curvas antecipadamente.
+    Retorna: (cx_bottom, cx_mid, cx_top, center_x, thresh_black, green_status, mask_green)
     """
-    # 1. Filtros morfológicos para isolar a linha preta do chão claro
+    # ====== DETECÇÃO DA LINHA PRETA ======
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY_INV)
 
     h, w = thresh.shape
-    
-    # 2. Definição das coordenadas verticais (Y) das fatias
     h_bottom_start, h_bottom_end = int(h * 0.70), h
     h_mid_start, h_mid_end = int(h * 0.40), int(h * 0.70)
     h_top_start, h_top_end = int(h * 0.10), int(h * 0.40)
 
-    # 3. Recorte do mapa binário
     roi_bottom = thresh[h_bottom_start:h_bottom_end, :]
     roi_mid = thresh[h_mid_start:h_mid_end, :]
     roi_top = thresh[h_top_start:h_top_end, :]
 
     def get_centroid(roi_img):
-        """Calcula o Momento Espacial para encontrar o Centro de Massa da linha detectada."""
         M = cv2.moments(roi_img)
-        if M["m00"] > 0:
-            return int(M["m10"] / M["m00"])
+        if M["m00"] > 0: return int(M["m10"] / M["m00"])
         return None
 
     cx_bottom = get_centroid(roi_bottom)
     cx_mid = get_centroid(roi_mid)
     cx_top = get_centroid(roi_top)
 
-    return cx_bottom, cx_mid, cx_top, w // 2, thresh
+    # ====== DETECÇÃO DOS MARCADORES VERDES (OBR) ======
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask_green = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+    
+    # O verde deve ser buscado na metade inferior da tela para não capturar 
+    # o cenário fora da arena ou camisas da arquibancada.
+    mask_green_roi = mask_green[int(h*0.5):h, :]
+    
+    # Fatiamos verticalmente no meio para saber se o verde está na Esquerda ou Direita
+    left_green = mask_green_roi[:, :w//2]
+    right_green = mask_green_roi[:, w//2:]
+    
+    green_left_area = cv2.countNonZero(left_green)
+    green_right_area = cv2.countNonZero(right_green)
+    
+    green_status = "NONE"
+    # Lógica baseada em área. Se os dois lados possuem muitos pixels verdes, é Retorno de 180°
+    if green_left_area > MIN_GREEN_AREA and green_right_area > MIN_GREEN_AREA:
+        green_status = "BOTH"
+    elif green_left_area > MIN_GREEN_AREA:
+        green_status = "LEFT"
+    elif green_right_area > MIN_GREEN_AREA:
+        green_status = "RIGHT"
+
+    return cx_bottom, cx_mid, cx_top, w // 2, thresh, green_status, mask_green
 
 def calculate_motor_speeds(correction: float, dynamic_base_speed: int) -> Tuple[int, int, str]:
-    """
-    Converte o erro numérico do PID em pulsos PWM para as rodas.
-    Aplica ativamente as regras de limite mecânico (Motor Deadband).
-    """
-    # Adiciona/subtrai a força de correção na velocidade de cruzeiro atual
     pwm_l = dynamic_base_speed + correction
     pwm_r = dynamic_base_speed - correction
     
-    # --- LÓGICA DE ZONA MORTA (MECÂNICA DE PIVOT) ---
-    # Se a roda recebe um sinal fraco (ex: 70), ela apenas consome bateria e trava o robô.
-    # Ao jogar esse valor para 0 intencionalmente, forçamos o robô a girar no próprio eixo (pivot),
-    # o que resulta em curvas de 90 graus incrivelmente nítidas para a OBR.
-    if pwm_l < MIN_MOTION_PWM:
-        pwm_l = 0
-    if pwm_r < MIN_MOTION_PWM:
-        pwm_r = 0
+    if pwm_l < MIN_MOTION_PWM: pwm_l = 0
+    if pwm_r < MIN_MOTION_PWM: pwm_r = 0
         
-    # Assegura matematicamente que o valor não passe do suportado pelo hardware
     pwm_l = int(np.clip(pwm_l, 0, MAX_PWM))
     pwm_r = int(np.clip(pwm_r, 0, MAX_PWM))
     
-    # Geração do rótulo da classe para o treinamento da Inteligência Artificial.
-    # Aumentamos a margem (20) para classificar oscilações de correção normais como 'Reta' (F).
     if abs(correction) < 20: 
         label = "F"
     else:
@@ -276,14 +287,13 @@ def calculate_motor_speeds(correction: float, dynamic_base_speed: int) -> Tuple[
     return pwm_l, pwm_r, label
 
 def main() -> None:
-    # 1. Inicialização de Periféricos e Lógica
     cap = setup_camera()
     controller = RobotController()
-    state_manager = StateManager(gap_timeout_s=1.2) # Ajuste esse tempo se o GAP físico for muito longo
+    state_manager = StateManager(gap_timeout_s=1.2) 
     pid = PIDController(kp=5.0, ki=0.0, kd=0.0)
 
     print("==================================================")
-    print(f"[INIT] Sistema de Visão e FSM Iniciados.")
+    print(f"[INIT] Sistema de Visão OBR e FSM Iniciados.")
     print(f"[INIT] Área Útil (Deadzone): +/- {int(DEADZONE_PX)} pixels.")
     print("==================================================\n")
 
@@ -297,29 +307,22 @@ def main() -> None:
             ret, frame = cap.read()
             if not ret: break
 
-            # 2. Extração de Features Visuais
-            cx_bottom, cx_mid, cx_top, center, thresh = process_vision(frame)
+            cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green = process_vision(frame)
             
-            # Uma linha é considerada "detectada" se pelo menos o meio ou a base a enxergarem
             line_detected = (cx_bottom is not None) or (cx_mid is not None)
+            current_state = state_manager.update(line_detected, green_status, cx_bottom, center)
 
-            # 3. Atualização da Máquina de Estados
-            current_state = state_manager.update(line_detected)
-
-            # 4. Execução do Comportamento baseado no Estado
             match current_state:
                 
                 case RobotState.FOLLOWING_LINE:
                     current_error = 0
                     dynamic_base_speed = BASE_SPEED
 
-                    # Rastreio da linha
                     if cx_bottom is not None:
                         current_error = cx_bottom - center
                     elif cx_mid is not None:
                         current_error = cx_mid - center
 
-                    # Freio Inteligente (Visão Preditiva)
                     if cx_top is not None and cx_bottom is not None:
                         curve_intensity = abs(cx_top - cx_bottom)
                         if curve_intensity > 40: 
@@ -339,17 +342,34 @@ def main() -> None:
                         last_decision_log = label
                         
                 case RobotState.HANDLING_GAP:
-                    # Durante um GAP, o robô ignora o PID e "congela" a direção para frente.
-                    # Congelar a integral evita que o PID "acumule" erro invisível e dê um tranco ao voltar.
                     pid.integral = 0 
-                    
-                    # Usa uma velocidade ligeiramente reduzida para manter tração constante sem derrapar
                     safe_gap_speed = max(MIN_MOTION_PWM, BASE_SPEED - 20)
-                    
-                    # O label 'G' anota isso no dataset para que a IA aprenda o conceito de inércia
                     controller.send_pwm(safe_gap_speed, safe_gap_speed)
                     controller.save_data(frame, safe_gap_speed, safe_gap_speed, "G")
                     
+                case RobotState.ALIGNING_TURN:
+                    # Durante o alinhamento, ignora o erro e apenas segue em frente para cruzar a área verde
+                    pid.integral = 0
+                    align_speed = max(MIN_MOTION_PWM, BASE_SPEED - 10)
+                    controller.send_pwm(align_speed, align_speed)
+                    
+                    # Rotula no dataset como 'T' (Turn Setup) para não poluir os dados de frente normal
+                    controller.save_data(frame, align_speed, align_speed, "T")
+                    
+                case RobotState.EXECUTING_TURN:
+                    # Não salvamos imagens durante o pivot para não poluir o dataset de AI 
+                    # com imagens super borradas que ele não deve tentar imitar
+                    pid.integral = 0
+                    
+                    # Manda o comando da firmware do Arduino (New-Omega.ino)
+                    if state_manager.turn_intent == "LEFT":
+                        controller.send_raw("M,L")
+                    elif state_manager.turn_intent == "RIGHT":
+                        controller.send_raw("M,R")
+                    elif state_manager.turn_intent == "BOTH":
+                        # Giro 180 usa um lado fixo até achar a linha traseira
+                        controller.send_raw("M,REV")
+
                 case RobotState.STOPPED:
                     pid.integral = 0
                     controller.send_pwm(0, 0)
@@ -367,6 +387,7 @@ def main() -> None:
                 if cx_top is not None: cv2.circle(frame, (cx_top, int(CAM_HEIGHT * 0.25)), 8, (0, 0, 255), -1)
 
                 cv2.imshow("Sistema de Visao - Binarizado", thresh)
+                cv2.imshow("Sistema de Visao - Mascara Verde", mask_green)
                 cv2.imshow("Sistema de Visao - RGB", frame)
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'): 
