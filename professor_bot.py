@@ -44,6 +44,13 @@ UPPER_GREEN = np.array([85, 255, 255])
 # Quantidade mínima de pixels verdes juntos para não confundir com ruído
 MIN_GREEN_AREA = 800 
 
+# Configurações de Cor para a Linha Vermelha (HSV wrap-around)
+LOWER_RED_1 = np.array([0, 70, 50])
+UPPER_RED_1 = np.array([10, 255, 255])
+LOWER_RED_2 = np.array([170, 70, 50])
+UPPER_RED_2 = np.array([180, 255, 255])
+MIN_RED_AREA = 1500 # Área maior, pois a linha vermelha cruza a tela toda
+
 # ==========================================
 # GESTÃO DE SESSÃO E DADOS (DATASET)
 # ==========================================
@@ -55,6 +62,7 @@ class RobotState(Enum):
     HANDLING_GAP = auto()
     ALIGNING_TURN = auto()  # Anda reto um pouco para posicionar o eixo no cruzamento
     EXECUTING_TURN = auto() # Gira freneticamente no eixo até achar a linha de novo
+    COURSE_FINISHED = auto() # Novo estado para a linha vermelha
     STOPPED = auto()
 
 class PIDController:
@@ -92,36 +100,33 @@ class PIDController:
 class StateManager:
     """
     Gerenciador da Máquina de Estados Finitos (FSM).
-    Responsável por transitar entre rastreio, inércia (gap) e curvas complexas (verdes).
+    Responsável por transitar entre rastreio, inércia (gap), curvas complexas (verdes) e fim (vermelho).
     """
     def __init__(self, gap_timeout_s: float = 1.2):
         self.state = RobotState.FOLLOWING_LINE
         self.gap_timer_start = 0.0
         self.gap_timeout_s = gap_timeout_s 
         
-        # Variáveis exclusivas para cruzamentos verdes
         self.turn_intent = "NONE"
         self.turn_timer_start = 0.0
-        
-        # Tempo que o robô anda reto APÓS ver o verde para centralizar as rodas no cruzamento
         self.ALIGN_TIME_S = 1.25 
-        
-        # Tempo cego: Ignora a câmera logo que começa a girar para não ser
-        # enganado pela própria linha de onde ele acabou de sair.
         self.BLIND_TURN_TIME_S = 0.95 
         
-    def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int) -> RobotState:
+    # CORREÇÃO: Adicionamos red_detected na assinatura da função
+    def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
         current_time = time.time()
         
         match self.state:
             case RobotState.FOLLOWING_LINE:
-                if green_status != "NONE":
-                    # Gatilho do Marcador Verde! Salva a intenção e começa a alinhar.
+                # CORREÇÃO: A lógica de checar o vermelho e verde fica AQUI dentro!
+                if red_detected:
+                    self.state = RobotState.COURSE_FINISHED
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha detectada! Fim do trajeto.")
+                elif green_status != "NONE":
                     self.turn_intent = green_status
                     self.state = RobotState.ALIGNING_TURN
                     self.turn_timer_start = current_time
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Marcador Verde ({green_status}) detectado! Alinhando para a curva...")
-                    
                 elif not line_detected:
                     self.state = RobotState.HANDLING_GAP
                     self.gap_timer_start = current_time
@@ -133,27 +138,23 @@ class StateManager:
                     print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] GAP superado! Retomando rastreio PID.\n")
                 elif (current_time - self.gap_timer_start) > self.gap_timeout_s:
                     self.state = RobotState.STOPPED
-                    print(f"[{time.strftime('%H:%M:%S')}] [ALERTA CRÍTICO] Tempo de inércia esgotado. Nenhuma linha encontrada após o GAP.")
+                    print(f"[{time.strftime('%H:%M:%S')}] [ALERTA CRÍTICO] Tempo esgotado no GAP.")
             
             case RobotState.ALIGNING_TURN:
-                # Espera as rodas chegarem no centro geográfico da intersecção
                 if (current_time - self.turn_timer_start) > self.ALIGN_TIME_S:
                     self.state = RobotState.EXECUTING_TURN
                     self.turn_timer_start = current_time
-                    print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Posição alcançada! Executando Pivot de curva...")
+                    print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Executando Pivot de curva...")
                     
             case RobotState.EXECUTING_TURN:
                 time_in_turn = current_time - self.turn_timer_start
-                
-                # Só começa a procurar a linha preta DEPOIS de passar o tempo cego
                 if time_in_turn > self.BLIND_TURN_TIME_S:
                     if cx_bottom is not None:
-                        # Se achou a linha e ela está minimamente próxima ao centro, encerra o giro
                         dist_to_center = abs(cx_bottom - center)
-                        if dist_to_center < (DEADZONE_PX * 2): # Margem um pouco maior para agarrar a linha
+                        if dist_to_center < (DEADZONE_PX * 2): 
                             self.state = RobotState.FOLLOWING_LINE
                             self.turn_intent = "NONE"
-                            print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Curva verde concluída! Retomando linha.\n")
+                            print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Curva concluída!\n")
                             
             case RobotState.STOPPED:
                 if line_detected:
@@ -216,7 +217,7 @@ def setup_camera() -> cv2.VideoCapture:
     
     return cap
 
-def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray, str, np.ndarray]:
+def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray, str, np.ndarray, bool]:
     """
     Retorna: (cx_bottom, cx_mid, cx_top, center_x, thresh_black, green_status, mask_green)
     """
@@ -259,6 +260,7 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     green_right_area = cv2.countNonZero(right_green)
     
     green_status = "NONE"
+
     # Lógica baseada em área. Se os dois lados possuem muitos pixels verdes, é Retorno de 180°
     if green_left_area > MIN_GREEN_AREA and green_right_area > MIN_GREEN_AREA:
         green_status = "BOTH"
@@ -267,7 +269,18 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     elif green_right_area > MIN_GREEN_AREA:
         green_status = "RIGHT"
 
-    return cx_bottom, cx_mid, cx_top, w // 2, thresh, green_status, mask_green
+    # ====== DETECÇÃO DA LINHA VERMELHA (PARADA) ======
+    mask_red_1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    mask_red_2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
+
+    # Focamos no centro inferior da tela para ter certeza de que a linha 
+    # vermelha está no chão, bem debaixo do robô
+    mask_red_roi = mask_red[int(h*0.6):h, :]
+    red_area = cv2.countNonZero(mask_red_roi)
+    red_detected = (red_area > MIN_RED_AREA)
+
+    return cx_bottom, cx_mid, cx_top, w // 2, thresh, green_status, mask_green, red_detected
 
 def calculate_motor_speeds(correction: float, dynamic_base_speed: int) -> Tuple[int, int, str]:
     pwm_l = dynamic_base_speed + correction
@@ -307,14 +320,20 @@ def main() -> None:
             ret, frame = cap.read()
             if not ret: break
 
-            cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green = process_vision(frame)
+            # CORREÇÃO: Apenas UMA chamada para process_vision, recebendo todas as variáveis
+            cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green, red_detected = process_vision(frame)
             
+            # CORREÇÃO: Retornamos a variável line_detected que havia sido apagada
             line_detected = (cx_bottom is not None) or (cx_mid is not None)
-            current_state = state_manager.update(line_detected, green_status, cx_bottom, center)
+            
+            # Atualiza o estado
+            current_state = state_manager.update(line_detected, green_status, cx_bottom, center, red_detected)
 
             match current_state:
                 
                 case RobotState.FOLLOWING_LINE:
+                    # CORREÇÃO: Limpamos os ifs daqui. Se a FSM disse que é FOLLOWING_LINE, 
+                    # apenas executamos o PID puro!
                     current_error = 0
                     dynamic_base_speed = BASE_SPEED
 
@@ -374,6 +393,14 @@ def main() -> None:
                     pid.integral = 0
                     controller.send_pwm(0, 0)
                     last_decision_log = "LOST"
+                
+                case RobotState.COURSE_FINISHED:
+                    # Trava definitiva. O robô não tenta mais voltar para FOLLOWING_LINE
+                    pid.integral = 0
+                    controller.send_pwm(0, 0)
+                    
+                    # Anotamos isso no dataset como 'END'
+                    controller.save_data(frame, 0, 0, "END")
 
             # ==========================================
             # DEBUG E VISUALIZAÇÃO
