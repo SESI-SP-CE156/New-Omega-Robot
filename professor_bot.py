@@ -276,9 +276,9 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
 
     # Focamos no centro inferior da tela para ter certeza de que a linha 
     # vermelha está no chão, bem debaixo do robô
-    mask_red_roi = mask_red[int(h*0.6):h, :]
+    mask_red_roi = mask_red[int(h * 0.85):h, :]
     red_area = cv2.countNonZero(mask_red_roi)
-    red_detected = (red_area > MIN_RED_AREA)
+    red_detected = (red_area > 800)
 
     return cx_bottom, cx_mid, cx_top, w // 2, thresh, green_status, mask_green, red_detected
 
