@@ -141,7 +141,7 @@ class StateManager:
         self.BLIND_TURN_TIME_S = 0.95 
 
         self.finish_timer_start = 0.0
-        self.FINISH_ALIGN_TIME_S = 0.45 
+        self.FINISH_ALIGN_TIME_S = 0.5 
         
     def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
         """Avalia as entradas sensoriais e transita entre os estados lógicos do robô."""
@@ -193,7 +193,7 @@ class StateManager:
                             self.turn_intent = "NONE"
                             print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Curva concluída!\n")
             
-            case RobotState.APPROACHING_FINISH:
+            case RobotState.    ACHING_FINISH:
                 if (current_time - self.finish_timer_start) > self.FINISH_ALIGN_TIME_S:
                     self.state = RobotState.COURSE_FINISHED
                     print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Posição final alcançada. Desligando motores.")
