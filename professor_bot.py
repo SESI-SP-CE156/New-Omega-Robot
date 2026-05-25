@@ -104,11 +104,11 @@ class StateManager:
         self.turn_timer_start = 0.0
         
         # Tempo que o robô anda reto APÓS ver o verde para centralizar as rodas no cruzamento
-        self.ALIGN_TIME_S = 0.45 
+        self.ALIGN_TIME_S = 1.25 
         
         # Tempo cego: Ignora a câmera logo que começa a girar para não ser
         # enganado pela própria linha de onde ele acabou de sair.
-        self.BLIND_TURN_TIME_S = 0.6 
+        self.BLIND_TURN_TIME_S = 0.95 
         
     def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int) -> RobotState:
         current_time = time.time()
