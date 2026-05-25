@@ -112,13 +112,11 @@ class StateManager:
         self.ALIGN_TIME_S = 1.25 
         self.BLIND_TURN_TIME_S = 0.95 
         
-    # CORREÇÃO: Adicionamos red_detected na assinatura da função
     def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
         current_time = time.time()
         
         match self.state:
             case RobotState.FOLLOWING_LINE:
-                # CORREÇÃO: A lógica de checar o vermelho e verde fica AQUI dentro!
                 if red_detected:
                     self.state = RobotState.COURSE_FINISHED
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha detectada! Fim do trajeto.")
@@ -133,7 +131,11 @@ class StateManager:
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha perdida! Iniciando inércia para atravessar o GAP.")
                     
             case RobotState.HANDLING_GAP:
-                if line_detected:
+                # CORREÇÃO: Prioridade Máxima para a Linha Vermelha mesmo durante o GAP!
+                if red_detected:
+                    self.state = RobotState.COURSE_FINISHED
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha Vermelha detectada durante o GAP! Fim do trajeto.")
+                elif line_detected:
                     self.state = RobotState.FOLLOWING_LINE
                     print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] GAP superado! Retomando rastreio PID.\n")
                 elif (current_time - self.gap_timer_start) > self.gap_timeout_s:
@@ -276,7 +278,7 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
 
     # Focamos no centro inferior da tela para ter certeza de que a linha 
     # vermelha está no chão, bem debaixo do robô
-    mask_red_roi = mask_red[int(h * 0.85):h, :]
+    mask_red_roi = mask_red[int(h * 0.90):h, :]
     red_area = cv2.countNonZero(mask_red_roi)
     red_detected = (red_area > 800)
 
@@ -303,7 +305,7 @@ def main() -> None:
     cap = setup_camera()
     controller = RobotController()
     state_manager = StateManager(gap_timeout_s=1.2) 
-    pid = PIDController(kp=5.0, ki=0.0, kd=0.0)
+    pid = PIDController(kp=5.0, ki=0.15, kd=0.001)
 
     print("==================================================")
     print(f"[INIT] Sistema de Visão OBR e FSM Iniciados.")
