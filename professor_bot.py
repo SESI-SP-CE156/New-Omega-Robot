@@ -251,8 +251,16 @@ def setup_camera() -> cv2.VideoCapture:
     cv2.setUseOptimized(True)
     cv2.setNumThreads(4)
 
-    if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'): cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
-    if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'): cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'):
+        cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
+
+    # Tenta forçar EXPOSIÇÃO MANUAL. 
+    # Em V4L2: 1 = Manual, 3 = Auto (Ou 0.25 para manual em drivers antigos).
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
+    cap.set(cv2.CAP_PROP_EXPOSURE, 100) # Ajuste empiricamente se ficar claro/escuro demais
+
+    if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'):
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 
     print("[SISTEMA] Aguardando warm-up do sensor da câmera...")
     time.sleep(2.0) # Tempo vital para o hardware estabilizar a exposição
