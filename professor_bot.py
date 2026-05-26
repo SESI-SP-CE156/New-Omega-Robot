@@ -235,21 +235,51 @@ class RobotController:
 def setup_camera() -> cv2.VideoCapture:
     """Configura o hardware da câmera nativamente no Linux (V4L2)."""
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # CORREÇÃO: YUYV (Raw) é muito mais estável no Raspberry Pi para 640x480.
+    # O MJPEG sofre corrupção de cabeçalho quando o uso de CPU oscila.
     cap.set(
         cv2.CAP_PROP_FOURCC,
-        cv2.VideoWriter_fourcc(*'MJPEG')
+        cv2.VideoWriter_fourcc(*'YUYV') 
     )
     cv2.setUseOptimized(True)
     cv2.setNumThreads(4)
 
     if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'): cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
     if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'): cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+
+    print("[SISTEMA] Aguardando warm-up do sensor da câmera...")
+    time.sleep(2.0) # Tempo vital para o hardware estabilizar a exposição
+    
+    # Esvazia os frames corrompidos iniciais do buffer de hardware
+    for _ in range(5):
+        cap.read()
+
     return cap
+
+def is_frame_corrupted(frame: np.ndarray) -> bool:
+    """
+    Analisa estatisticamente se o frame apresenta anomalias de hardware (corrupção YUV).
+    Frames estourados (verdes/roxos) apresentam variância próxima de zero.
+    """
+    if frame is None or frame.size == 0:
+        return True
+        
+    # Uma imagem real de uma pista da OBR tem alto contraste (fundo branco, linha preta).
+    # Um frame "tela verde" sólido tem variância ínfima.
+    variance = np.var(frame)
+    
+    # Limiar empírico. Uma pista real terá variância muito maior que 10.
+    if variance < 10.0: 
+        return True
+        
+    return False
 
 def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Optional[int], int, np.ndarray, str, np.ndarray, bool]:
     """
@@ -339,19 +369,10 @@ def main() -> None:
             loop_start_time = time.time()
             ret, frame = cap.read()
             
-            #Verifica se a captura falhou
-            if not ret:
-                print("[CAMERA] Falha ao capturar frame")
-                continue
-            
-            #Verifica se o frame veio vazio
-            if frame is None:
-                print("[CAMERA] Frame none")
-                continue
-
-            #Verifica se o frame está corrompido
-            if frame.size == 0:
-                print("[CAMERA] Frame vazio ou corrompido")
+            if not ret or is_frame_corrupted(frame):
+                print(f"[{time.strftime('%H:%M:%S')}] [AVISO] Frame descartado por falha na câmera ou corrupção YUV.")
+                # Pausa para sincronia do barramento antes de tentar o próximo
+                time.sleep(0.05) 
                 continue
 
             cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green, red_detected = process_vision(frame)
