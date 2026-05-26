@@ -315,7 +315,7 @@ def main() -> None:
     cap = setup_camera()
     controller = RobotController()
     state_manager = StateManager(gap_timeout_s=1.2) 
-    pid = PIDController(kp=5.0, ki=0.40, kd=0.1)
+    pid = PIDController(kp=5.0, ki=0.20, kd=0.01)
 
     print("==================================================")
     print(f"[INIT] Sistema de Visão OBR e FSM Iniciados.")
