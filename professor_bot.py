@@ -128,7 +128,7 @@ class StateManager:
         self.BLIND_TURN_TIME_S = 0.95 
 
         self.finish_timer_start = 0.0
-        self.FINISH_ALIGN_TIME_S = 0.5 
+        self.FINISH_ALIGN_TIME_S = 1.2
         
     def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
         """Avalia as entradas sensoriais e transita entre os estados lógicos do robô."""
@@ -315,7 +315,7 @@ def main() -> None:
     cap = setup_camera()
     controller = RobotController()
     state_manager = StateManager(gap_timeout_s=1.2) 
-    pid = PIDController(kp=5.0, ki=0.15, kd=0.001)
+    pid = PIDController(kp=5.0, ki=0.40, kd=0.1)
 
     print("==================================================")
     print(f"[INIT] Sistema de Visão OBR e FSM Iniciados.")
