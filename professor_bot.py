@@ -235,10 +235,18 @@ class RobotController:
 def setup_camera() -> cv2.VideoCapture:
     """Configura o hardware da câmera nativamente no Linux (V4L2)."""
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAM_FPS) 
-    
+    cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(
+        cv2.CAP_PROP_FOURCC,
+        cv2.VideoWriter_fourcc(*'MJPEG')
+    )
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(4)
+
     if hasattr(cv2, 'CAP_PROP_POWER_LINE_FREQUENCY'): cap.set(cv2.CAP_PROP_POWER_LINE_FREQUENCY, 2)
     if hasattr(cv2, 'CAP_PROP_AUTOFOCUS'): cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
     return cap
@@ -330,7 +338,21 @@ def main() -> None:
         while True:
             loop_start_time = time.time()
             ret, frame = cap.read()
-            if not ret: break
+            
+            #Verifica se a captura falhou
+            if not ret:
+                print("[CAMERA] Falha ao capturar frame")
+                continue
+            
+            #Verifica se o frame veio vazio
+            if frame is None:
+                print("[CAMERA] Frame none")
+                continue
+
+            #Verifica se o frame está corrompido
+            if frame.size == 0:
+                print("[CAMERA] Frame vazio ou corrompido")
+                continue
 
             cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green, red_detected = process_vision(frame)
             line_detected = (cx_bottom is not None) or (cx_mid is not None)
