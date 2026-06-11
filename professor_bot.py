@@ -349,25 +349,71 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     cx_mid = get_centroid(roi_mid)
     cx_top = get_centroid(roi_top)
 
+    # --- PROCESSAMENTO DO VERDE BASEADO EM GEOMETRIA COMPORTAMENTAL ---
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask_green = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-    mask_green_roi = mask_green[int(h*0.5):h, :]
-    left_green = mask_green_roi[:, :w//2]
-    right_green = mask_green_roi[:, w//2:]
     
-    green_left_area = cv2.countNonZero(left_green)
-    green_right_area = cv2.countNonZero(right_green)
+    # Isola a ROI do verde na metade inferior do frame
+    h_roi_green_start = int(h * 0.5)
+    mask_green_roi = mask_green[h_roi_green_start:h, :]
     
-    green_status = "NONE"
-    if green_left_area > MIN_GREEN_AREA and green_right_area > MIN_GREEN_AREA: green_status = "BOTH"
-    elif green_left_area > MIN_GREEN_AREA: green_status = "LEFT"
-    elif green_right_area > MIN_GREEN_AREA: green_status = "RIGHT"
+    # Encontra contornos dos blocos verdes na ROI
+    contours_green, _ = cv2.findContours(mask_green_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    green_left_valid = False
+    green_right_valid = False
+    
+    for contour in contours_green:
+        area = cv2.contourArea(contour)
+        if area > MIN_GREEN_AREA:
+            # Obtém a caixa delimitadora (Bounding Box) em relação à ROI do verde
+            gx, gy, gw, gh = cv2.boundingRect(contour)
+            
+            # Converte a coordenada Y para o espaço global do frame completo
+            abs_gy_bottom = gy + gh + h_roi_green_start
+            
+            # Define uma janela de inspeção logo ABAIXO do quadrado verde encontrado
+            # Procuramos por fita preta no eixo Y imediatamente abaixo da caixa
+            y_check_start = abs_gy_bottom
+            y_check_end = min(h, abs_gy_bottom + 35) # Janela de 35 pixels de altura
+            
+            x_check_start = max(0, gx - 15)
+            x_check_end = min(w, gx + gw + 15)
+            
+            # Analisa a densidade da linha na máscara binária (thresh) abaixo do verde
+            roi_line_below = thresh[y_check_start:y_check_end, x_check_start:x_check_end]
+            
+            if roi_line_below.size > 0:
+                # Conta quantos pixels de linha (brancos no thresh devido ao BINARY_INV) existem abaixo
+                line_pixels = cv2.countNonZero(roi_line_below)
+                line_density = line_pixels / roi_line_below.size
+                
+                # Se houver fita preta abaixo do marcador verde, ele está "depois" da linha.
+                # Um limiar de 25% de preenchimento evita ruídos e valida uma linha real.
+                if line_density > 0.25:
+                    continue  # IGNORA este marcador verde e passa para o próximo contorno
+            
+            # Se passou pela validação, classifica a direção horizontal
+            cx_green = gx + (gw // 2)
+            if cx_green < (w // 2):
+                green_left_valid = True
+            else:
+                green_right_valid = True
 
+    # Determina o status consolidado para a FSM
+    green_status = "NONE"
+    if green_left_valid and green_right_valid:
+        green_status = "BOTH"
+    elif green_left_valid:
+        green_status = "LEFT"
+    elif green_right_valid:
+        green_status = "RIGHT"
+
+    # --- PROCESSAMENTO DO VERMELHO ---
     mask_red_1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
     mask_red_2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
     mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
 
-    # Verifica o vermelho nos 30% inferiores da tela (0.70) para evitar Frame Skipping
     mask_red_roi = mask_red[int(h * 0.70):h, :]
     red_area = cv2.countNonZero(mask_red_roi)
     red_detected = (red_area > MIN_RED_AREA)
