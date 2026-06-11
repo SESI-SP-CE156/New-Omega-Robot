@@ -26,7 +26,7 @@ SERIAL_PORT = "/dev/ttyACM0"
 BAUD_RATE = 115200
 
 MAX_PWM = 250
-BASE_SPEED = 140
+BASE_SPEED = 180
 
 # ZONA MORTA MECÂNICA (Torque de Estol):
 # PWM abaixo de 110 não tem força para vencer a inércia e o peso do robô.
