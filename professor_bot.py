@@ -349,15 +349,14 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     cx_mid = get_centroid(roi_mid)
     cx_top = get_centroid(roi_top)
 
-    # --- PROCESSAMENTO DO VERDE BASEADO EM GEOMETRIA COMPORTAMENTAL ---
+    # --- PROCESSAMENTO DO VERDE BASEADO EM GEOMETRIA DA OBR ---
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask_green = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
     
-    # Isola a ROI do verde na metade inferior do frame
-    h_roi_green_start = int(h * 0.5)
+    # Isola a ROI do verde (usamos a metade inferior para evitar rastrear o horizonte)
+    h_roi_green_start = int(h * 0.40)
     mask_green_roi = mask_green[h_roi_green_start:h, :]
-    
-    # Encontra contornos dos blocos verdes na ROI
+
     contours_green, _ = cv2.findContours(mask_green_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     green_left_valid = False
@@ -366,44 +365,57 @@ def process_vision(frame: np.ndarray) -> Tuple[Optional[int], Optional[int], Opt
     for contour in contours_green:
         area = cv2.contourArea(contour)
         if area > MIN_GREEN_AREA:
-            # Obtém a caixa delimitadora (Bounding Box) em relação à ROI do verde
+            # Obtém as coordenadas da caixa ao redor do quadrado verde
             gx, gy, gw, gh = cv2.boundingRect(contour)
+            abs_gy = gy + h_roi_green_start
+            abs_gy_bottom = abs_gy + gh
             
-            # Converte a coordenada Y para o espaço global do frame completo
-            abs_gy_bottom = gy + gh + h_roi_green_start
-            
-            # Define uma janela de inspeção logo ABAIXO do quadrado verde encontrado
-            # Procuramos por fita preta no eixo Y imediatamente abaixo da caixa
-            y_check_start = abs_gy_bottom
-            y_check_end = min(h, abs_gy_bottom + 35) # Janela de 35 pixels de altura
-            
+            # --- REGRA 1: "ANTES DA LINHA PRETA HORIZONTAL" ---
+            # Se houver fita preta imediatamente ABAIXO do marcador verde, 
+            # significa que o robô já passou da intersecção (o marcador está depois da curva).
+            y_check_below_start = abs_gy_bottom
+            y_check_below_end = min(h, abs_gy_bottom + 25)
             x_check_start = max(0, gx - 15)
             x_check_end = min(w, gx + gw + 15)
             
-            # Analisa a densidade da linha na máscara binária (thresh) abaixo do verde
-            roi_line_below = thresh[y_check_start:y_check_end, x_check_start:x_check_end]
+            roi_below = thresh[y_check_below_start:y_check_below_end, x_check_start:x_check_end]
+            has_line_below = (cv2.countNonZero(roi_below) / roi_below.size) > 0.25 if roi_below.size > 0 else False
             
-            if roi_line_below.size > 0:
-                # Conta quantos pixels de linha (brancos no thresh devido ao BINARY_INV) existem abaixo
-                line_pixels = cv2.countNonZero(roi_line_below)
-                line_density = line_pixels / roi_line_below.size
-                
-                # Se houver fita preta abaixo do marcador verde, ele está "depois" da linha.
-                # Um limiar de 25% de preenchimento evita ruídos e valida uma linha real.
-                if line_density > 0.25:
-                    continue  # IGNORA este marcador verde e passa para o próximo contorno
-            
-            # Se passou pela validação, classifica a direção horizontal
-            cx_green = gx + (gw // 2)
-            if cx_green < (w // 2):
-                green_left_valid = True
-            else:
-                green_right_valid = True
+            if has_line_below:
+                continue # Falso Positivo: Marcador está depois da curva, é ignorado.
 
-    # Determina o status consolidado para a FSM
+            # --- REGRA 2: POSIÇÃO RELATIVA À LINHA VERTICAL (Esquerda ou Direita?) ---
+            # Analisamos a vizinhança lateral (45 pixels) do marcador verde.
+            roi_left = thresh[abs_gy:abs_gy_bottom, max(0, gx - 45):gx]
+            roi_right = thresh[abs_gy:abs_gy_bottom, gx + gw:min(w, gx + gw + 45)]
+            
+            dens_left = cv2.countNonZero(roi_left) / roi_left.size if roi_left.size > 0 else 0
+            dens_right = cv2.countNonZero(roi_right) / roi_right.size if roi_right.size > 0 else 0
+            
+            is_left = False
+            is_right = False
+            
+            if dens_left > 0.15:
+                # Se há fita preta à ESQUERDA do quadrado verde, logo o quadrado está à DIREITA da fita.
+                is_right = True
+            elif dens_right > 0.15:
+                # Se há fita preta à DIREITA do quadrado verde, logo o quadrado está à ESQUERDA da fita.
+                is_left = True
+                
+            # --- REGRA 3: GATILHO DE PROFUNDIDADE (O MOMENTO CERTO) ---
+            # O robô só deve acionar a intenção de curva quando o marcador verde 
+            # chegar na base da tela (75% para baixo). Isso garante que ele chegue
+            # fisicamente perto da intersecção antes de travar o PID e iniciar o giro.
+            if (is_left or is_right) and (abs_gy_bottom > h * 0.75):
+                if is_left: green_left_valid = True
+                if is_right: green_right_valid = True
+
+    # --- DETERMINAÇÃO DA DIREÇÃO FINAL ---
+    # Se na mesma varredura as variáveis direita e esquerda ficarem verdadeiras (2 quadrados), 
+    # a hierarquia prioriza o "BOTH" para executar o 180º.
     green_status = "NONE"
     if green_left_valid and green_right_valid:
-        green_status = "BOTH"
+        green_status = "BOTH"  
     elif green_left_valid:
         green_status = "LEFT"
     elif green_right_valid:
