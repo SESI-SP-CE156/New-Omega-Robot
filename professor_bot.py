@@ -78,6 +78,7 @@ class RobotState(Enum):
     APPROACHING_FINISH = auto() # Solução de Frame-Skipping: Anda após ver o vermelho
     COURSE_FINISHED = auto()    # Missão concluída (Motores cortados)
     STOPPED = auto()            # Falha crítica de navegação
+    AVOIDING_OBSTACLE = auto()  # Desvio de obstáculo
 
 class PIDController:
     """
@@ -129,10 +130,19 @@ class StateManager:
 
         self.finish_timer_start = 0.0
         self.FINISH_ALIGN_TIME_S = 1.2
+
+        self.OBSTACLE_THRESHOLD_CM = 15.0
+        self.obstacle_timer_start = 0.0
         
-    def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool) -> RobotState:
+    def update(self, line_detected: bool, green_status: str, cx_bottom: Optional[int], center: int, red_detected: bool, distance: float) -> RobotState:
         """Avalia as entradas sensoriais e transita entre os estados lógicos do robô."""
         current_time = time.time()
+
+        if distance > 0.0 and distance < self.OBSTACLE_THRESHOLD_CM and self.state == RobotState.FOLLOWING_LINE:
+            self.state = RobotState.AVOIDING_OBSTACLE
+            self.obstacle_timer_start = current_time
+            print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Obstáculo a {distance}cm! Iniciando desvio...")
+            return self.state
         
         match self.state:
             case RobotState.FOLLOWING_LINE:
@@ -188,6 +198,11 @@ class StateManager:
                 if line_detected:
                     self.state = RobotState.FOLLOWING_LINE
                     print(f"\n[{time.strftime('%H:%M:%S')}] [ESTADO] Linha detectada novamente. Retomando missão.")
+
+            case RobotState.AVOIDING_OBSTACLE:
+                # O robô tentará voltar à linha. A transição de saída ocorrerá no main()
+                # quando a manobra finalizar e a linha for vista.
+                pass
                     
         return self.state
 
@@ -231,6 +246,24 @@ class RobotController:
             self.send_pwm(0, 0)
             self.ser.close()
         print("[SISTEMA] Conexão encerrada e arquivos salvos.")
+
+    def read_sensors(self) -> float:
+        """Lê e faz o parse da telemetria de forma não-bloqueante."""
+        distance = -1.0
+        if not self.ser: return distance
+        
+        # Esvazia o buffer lendo todas as linhas disponíveis.
+        # Mantemos apenas a última leitura válida.
+        while self.ser.in_waiting > 0:
+            try:
+                line = self.ser.readline().decode('utf-8').strip()
+                if line.startswith("T,"):
+                    parts = line.split(",")
+                    if len(parts) == 2:
+                        distance = float(parts[1])
+            except Exception:
+                pass # Ignora frames seriais corrompidos
+        return distance
 
 def setup_camera() -> cv2.VideoCapture:
     """Configura o hardware da câmera nativamente no Linux (V4L2)."""
@@ -386,8 +419,11 @@ def main() -> None:
             cx_bottom, cx_mid, cx_top, center, thresh, green_status, mask_green, red_detected = process_vision(frame)
             line_detected = (cx_bottom is not None) or (cx_mid is not None)
             
-            # Delega a decisão de Estado para a FSM (Machine Learning Comportamental)
-            current_state = state_manager.update(line_detected, green_status, cx_bottom, center, red_detected)
+            # 1. Busca dados físicos mais recentes
+            distance = controller.read_sensors()
+            
+            # 2. Atualiza a assinatura da chamada do update
+            current_state = state_manager.update(line_detected, green_status, cx_bottom, center, red_detected, distance)
 
             # Executa o comportamento físico baseado no Estado Lógico
             match current_state:
@@ -447,6 +483,29 @@ def main() -> None:
                     pid.integral = 0
                     controller.send_pwm(0, 0)
                     last_decision_log = "LOST"
+                
+                case RobotState.AVOIDING_OBSTACLE:
+                    pid.integral = 0
+                    time_in_avoid = time.time() - state_manager.obstacle_timer_start
+                    
+                    # Manobra padrão OBR de desvio (ajuste os tempos empiricamente na pista)
+                    if time_in_avoid < 0.6:
+                        controller.send_raw("M,R") # 1. Gira ~90º à direita
+                    elif time_in_avoid < 1.8:
+                        controller.send_pwm(BASE_SPEED, BASE_SPEED) # 2. Anda paralelo ao obstáculo
+                    elif time_in_avoid < 2.4:
+                        controller.send_raw("M,L") # 3. Gira ~90º à esquerda
+                    elif time_in_avoid < 3.8:
+                        controller.send_pwm(BASE_SPEED, BASE_SPEED) # 4. Ultrapassa obstáculo
+                    elif time_in_avoid < 4.4:
+                        controller.send_raw("M,L") # 5. Vira para voltar para a linha
+                    else:
+                        # 6. Segue reto até reencontrar a linha
+                        if line_detected:
+                            state_manager.state = RobotState.FOLLOWING_LINE
+                            print(f"[{time.strftime('%H:%M:%S')}] [ESTADO] Obstáculo superado. Retomando rastreio.")
+                        else:
+                            controller.send_pwm(BASE_SPEED, BASE_SPEED)
 
             if not HEADLESS_MODE:
                 cv2.line(frame, (int(center - DEADZONE_PX), 0), (int(center - DEADZONE_PX), CAM_HEIGHT), (255, 0, 0), 1)
